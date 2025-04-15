@@ -1,0 +1,6 @@
+venv
+log
+*.cache
+*.initiated
+.vscode
+__pycache__
