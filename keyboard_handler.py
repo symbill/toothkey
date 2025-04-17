@@ -1,4 +1,4 @@
-import os, sys
+import os, sys, time
 
 from pynput import keyboard
 from common import GlobalContext
@@ -45,20 +45,31 @@ class BullshitKeyboardHandler:
 
     listener = None
 
+    event_handlers = None
+
     @classmethod
-    def start(cls):
+    def get_event_handlers(cls):
 
-        if cls.listener is not None: return
+        if cls.event_handlers is not None: return cls.event_handlers
 
-        event_handlers = {
+        cls.event_handlers = {
             name: method.__func__.__get__(cls,cls)
             for name, method in cls.__dict__.items()
             if type(method) == classmethod and name.startswith('on_')
         }
 
+        return cls.event_handlers
+
+    @classmethod
+    def start(cls):
+
+        if cls.listener is not None and cls.listener.is_alive(): return
+
         cls.clear_screen()
 
-        cls.listener = keyboard.Listener(**event_handlers, suppress=True)
+        event_handlers = cls.get_event_handlers()
+
+        cls.listener = keyboard.Listener(**event_handlers, suppress=GlobalContext.grab_mode)
         cls.listener.start()
         cls.listener.join()
 
@@ -80,6 +91,7 @@ class BullshitKeyboardHandler:
         if cls.contains_toggle_grab_mode_keys():
             GlobalContext.toggle_grab_mode()
             cls.input_key_set.clear()
+            cls.listener.stop()
 
         if cls.contains_shut_down_keys():
             if not GlobalContext.grab_mode:

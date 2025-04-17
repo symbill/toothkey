@@ -10,7 +10,9 @@ async def start_device_handlers():
 
     loop = asyncio.get_running_loop()
 
-    await loop.run_in_executor(None, BullshitKeyboardHandler.start)
+    while True:
+        await loop.run_in_executor(None, BullshitKeyboardHandler.start)
+        await asyncio.sleep(0.1)
 
 def main():
 
