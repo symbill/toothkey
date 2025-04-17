@@ -98,7 +98,7 @@ class BullshitKeyboardHandler:
         if cls.contains_shut_down_keys():
             if not GlobalContext.grab_mode:
                 cls.active = False
-                sys.exit(0)
+                cls.listener.stop()
 
         cls.update_states()
 
