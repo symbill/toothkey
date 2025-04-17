@@ -33,6 +33,23 @@ class BullshitMouseHandler:
     listener = None
 
     @classmethod
+    def set_listener(cls):
+        # prevent spreading mouse event shits to os in grab mode
+        cls.listener = mouse.Listener(suppress=GlobalContext.grab_mode)
+        cls.listener.start()
+
+    @classmethod
+    def stop_listener(cls):
+        if cls.listener is not None:
+            cls.listener.stop()
+            cls.listener = None
+
+    @classmethod
+    async def toggle_suppres_mouse_event(cls):
+        cls.stop_listener()
+        cls.set_listener()
+
+    @classmethod
     def clamp_signed_byte(cls, val):
         return max(-127, min(127, val)) & 0xFF
 
@@ -72,9 +89,7 @@ class BullshitMouseHandler:
             print("[WARNING] No pieces of mouse shit found")
             return
 
-        # prevent spreading mouse event shits to os
-        cls.listener = mouse.Listener(suppress=True)
-        cls.listener.start()
+        cls.set_listener()
 
         dx = dy = sy = 0
 

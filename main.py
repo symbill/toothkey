@@ -12,7 +12,8 @@ async def start_device_handlers():
 
     while BullshitKeyboardHandler.active:
         await loop.run_in_executor(None, BullshitKeyboardHandler.start)
-        await asyncio.sleep(0.1)
+        if BullshitKeyboardHandler.active:
+            asyncio.create_task(BullshitMouseHandler.toggle_suppres_mouse_event())
 
 def main():
 
