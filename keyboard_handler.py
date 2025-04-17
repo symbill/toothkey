@@ -47,6 +47,8 @@ class BullshitKeyboardHandler:
 
     event_handlers = None
 
+    active = True
+
     @classmethod
     def get_event_handlers(cls):
 
@@ -95,6 +97,7 @@ class BullshitKeyboardHandler:
 
         if cls.contains_shut_down_keys():
             if not GlobalContext.grab_mode:
+                cls.active = False
                 sys.exit(0)
 
         cls.update_states()
