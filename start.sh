@@ -26,4 +26,6 @@ elif [ "$1" == "--reset-bluez" ]; then
     init_bluez
 fi
 
+xhost +SI:localuser:root
+
 sudo xterm -e "python3 main.py"
