@@ -30,4 +30,9 @@ It was created by a frustrated and sneaky office worker who owns an expensive me
 
 # Notes
 
-Unfortunately, if you ever stop or restart the program, you must completely remove the Bluetooth pairing between your iPhone and computer and redo the process of this Bullshitooth Emulator
+- Unfortunately, if you ever stop or restart the program, you must completely remove the Bluetooth pairing between your iPhone and computer and redo the process of this Bullshitooth Emulator
+- If a certain input field in a program—such as the address bar in Chrome or Code windows in vscode—is focused by the mouse cursor, it may capture the mouse scroll events, preventing them from being delivered to your iPhone. If all other features are working normally but mouse scrolling doesn't, try changing the focus on your computer to a different, more neutral input field in another program, then try again.
+- \+ 2025.04.21
+  - In grab mode, add a suppress feature to prevent keyboard and mouse events from propagating to the computer.
+  - Fixed a bug where special characters above the number keys were not being transmitted.
+  - Also, fix the issue where the window closes immediately after running `start.sh`.
