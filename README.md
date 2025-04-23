@@ -26,7 +26,9 @@ It was created by a frustrated and sneaky office worker who owns an expensive me
 
     (The Bullshitooth program will automatically authenticate and complete the pairing process.)
 
-3. Use `alt + shift` to toggle between grab/ungrab mode and enjoy using your iPhone while pretending to work!
+3. Use `alt + shift` to toggle between grab/ungrab mode and enjoy using your iPhone while pretending to work!  
+
+    (Press `ctrl + shift + c` to exit this bullshit in ungrab mode)
 
 # Notes
 
@@ -36,3 +38,6 @@ It was created by a frustrated and sneaky office worker who owns an expensive me
   - In grab mode, add a suppress feature to prevent keyboard and mouse events from propagating to the computer.
   - Fixed a bug where special characters above the number keys were not being transmitted.
   - Also, fix the issue where the window closes immediately after running `start.sh`.
+- \+ 2025.04.23
+  - Enhanced internal keyboard input handling
+  - Changed shut down key set from {`ctrl` + `c`} to {`ctrl` + `shift` + `c`}
