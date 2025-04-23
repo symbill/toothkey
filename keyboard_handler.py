@@ -19,7 +19,7 @@ class BullshitKeyboardHandler:
     toggle_grab_mode_key_set = { keyboard.Key.alt, keyboard.Key.shift }
     toggle_grab_mode_key_names = None
 
-    shut_down_key_set = { keyboard.Key.ctrl, keyboard.KeyCode.from_char('c') }
+    shut_down_key_set = { keyboard.Key.ctrl, keyboard.Key.shift, keyboard.KeyCode.from_char('c') }
     shut_down_key_names = None
 
     states = bytearray([
