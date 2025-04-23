@@ -30,6 +30,8 @@ It was created by a frustrated and sneaky office worker who owns an expensive me
 
     (Press `ctrl + shift + c` to exit this bullshit in ungrab mode)
 
+    (Or, you can customize toggle key set or shut down key set in `keyboard_handler.py`:19 line, 22 line)
+
 # Notes
 
 - Unfortunately, if you ever stop or restart the program, you must completely remove the Bluetooth pairing between your iPhone and computer and redo the process of this Bullshitooth Emulator
