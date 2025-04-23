@@ -93,6 +93,7 @@ class BullshitKeyboardHandler:
         if cls.contains_toggle_grab_mode_keys():
             GlobalContext.toggle_grab_mode()
             cls.input_key_set.clear()
+            cls.input_modifier_key_set.clear()
             cls.listener.stop()
 
         if cls.contains_shut_down_keys():
@@ -110,7 +111,7 @@ class BullshitKeyboardHandler:
 
         cls.clear_screen()
 
-        cls.input_key_set.discard(key)
+        cls.input_key_set.clear()
         cls.input_modifier_key_set.discard(key)
 
         cls.update_states()
