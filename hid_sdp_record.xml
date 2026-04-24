@@ -9,7 +9,7 @@
 		<sequence>
 			<sequence>
 				<uuid value="0x0100" />
-				<uint16 value="0x1011" />
+				<uint16 value="0x0011" />
 			</sequence>
 			<sequence>
 				<uuid value="0x0011" />
@@ -41,7 +41,7 @@
 			<sequence>
 				<sequence>
 					<uuid value="0x0100" />
-					<uint16 value="0x1013" />
+					<uint16 value="0x0013" />
 				</sequence>
 				<sequence>
 					<uuid value="0x0011" />
@@ -50,7 +50,7 @@
 		</sequence>
 	</attribute>
 	<attribute id="0x0100">
-		<text value="Bullshitooth Keyboard" />
+		<text value="Toothkey Keyboard" />
 	</attribute>
 	<attribute id="0x0101">
 		<text value="Simple bluetooth keyboard emulator" />
@@ -80,7 +80,7 @@
 		<sequence>
 			<sequence>
 				<uint8 value="0x22" />
-				<text encoding="hex" value="05010906A1018501050719E029E71500250175019508810295017508810395067508150025650507190029658100C005010902A10185020901A1000509190129031500250195037501810295017505810305010930093109381581257F750895038106C0C0" />
+				<text encoding="hex" value="05010906A1018501050719E029E71500250175019508810295017508810395067508150025650507190029658100C0" />
 			</sequence>
 		</sequence>
 	</attribute>
@@ -99,7 +99,7 @@
 		<uint16 value="0x0c80" />
 	</attribute>
 	<attribute id="0x020d">
-		<boolean value="false" />
+		<boolean value="true" />
 	</attribute>
 	<attribute id="0x020e">
 		<boolean value="true" />

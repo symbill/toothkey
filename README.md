@@ -1,45 +1,239 @@
-# Bullshitooth Emulator
+# Tooth-key
 
-A program that emulates a Bluetooth keyboard on an Ubuntu (24.04 LTS) machine to control an iPhone.
+A Linux (Kubuntu / Ubuntu) system-tray app that turns your computer into a
+Bluetooth HID keyboard so you can type into an iPhone, iPad, or any other
+Bluetooth-enabled host using your real keyboard.
 
-This project was inspired by [this great project](https://github.com/Alkaid-Benetnash/EmuBTHID).
+Originally forked from [Bullshitooth](https://github.com/Alkaid-Benetnash/EmuBTHID).
+Now keyboard-only, more reliable persisted pairing, and a proper tray UI.
 
-It was created by a frustrated and sneaky office worker who owns an expensive mechanical keyboard without Bluetooth functionality, works on an Ubuntu company computer, and wanted to secretly play game on his iPhone while pretending to work.
+## Features
 
-# Usage
+- **Pairs as a real HID keyboard** (Class of Device = Peripheral/Keyboard,
+  Numeric Comparison Secure Simple Pairing). iOS accepts it without fuss.
+- **Persistent bonds** — pair once, and subsequent app restarts just
+  reconnect. No re-pairing dance.
+- **Auto-reconnect** — if the iPhone drops off (out of range, sleep,
+  etc.), Tooth-key pages it back automatically when it's reachable again.
+- **System-tray UI** — runs quietly in the tray with a tooth icon; a red
+  X overlay appears when disconnected, and the tooth turns green while
+  grab mode is on.
+- **Tray menu** with Disconnect / Grab / Ungrab / Open log folder /
+  Restart / Exit. Left-click toggles grab while connected; otherwise it
+  opens the menu.
+- **Grab mode** suppresses keys from the host while forwarding them to
+  the Bluetooth peer. A floating tooth appears at the top-right of the
+  screen so you always know grab is active — click it to ungrab.
+- **Clean disconnect on exit** so iOS doesn't hold a stale link.
 
-1. Run the Bullshitooth program:
-    ```bash
-    . start.sh [--reset-all | --reset-bluez ]
-    ```
-    Run the above command in the terminal without any arguments, and it will execute automatically.
+## Requirements
 
-    You probably won't need to use any arguments, but if something doesn't work, try running it with one of the options.
+- Linux with BlueZ 5.x (tested on Kubuntu/Ubuntu 24.04)
+- A working Bluetooth controller (BR/EDR — classic Bluetooth)
+- Python 3.10+
+- X11 or Wayland session (the tray needs a display)
 
-    ### Arguments
-    - reset-all: Reinstalls all necessary dependencies.
-    - reset-bluez: Resets Bluetooth settings.
+All Python / apt dependencies are installed automatically on first run
+of `start.sh` (which `install.sh` invokes internally).
 
-2. Control your iPhone:
+## Install
 
-    Go to Settings > Bluetooth > Pair with the computer.
+The recommended way to use Tooth-key is to install it as a pair of
+systemd services — a system service for the BlueZ worker (starts at
+boot, runs as root, no password prompt) and a user service for the
+tray UI (starts when you log in).
 
-    (The Bullshitooth program will automatically authenticate and complete the pairing process.)
+```bash
+git clone <this-repo> ~/toothkey
+cd ~/toothkey
+./install.sh
+```
 
-3. Use `alt + shift` to toggle between grab/ungrab mode and enjoy using your iPhone while pretending to work!  
+`install.sh`:
 
-    (Press `ctrl + shift + c` to exit this bullshit in ungrab mode)
+- writes `/etc/systemd/system/toothkey-worker.service`
+  (BlueZ/HID worker, runs as root at boot)
+- writes `~/.config/systemd/user/toothkey-tray.service`
+  (system-tray UI, starts with your graphical session)
+- writes `/etc/sudoers.d/toothkey` so your user can
+  `systemctl {start,stop,restart} toothkey-worker.service` without a
+  password (needed by the tray's Restart menu item)
+- enables and starts both services
 
-    (Or, you can customize toggle key set or shut down key set in `keyboard_handler.py`:19 line, 22 line)
+The repo directory you cloned into becomes the permanent install
+location — systemd points `ExecStart=` at `worker.py` / `tray.py`
+inside it, so don't delete or move the directory after installing. To
+pick up code changes, either re-run `./install.sh` (safe to do
+repeatedly) or click Restart in the tray menu.
 
-# Notes
+To undo: `./uninstall.sh`. It removes the two services, the sudoers
+drop-in, and disables everything `install.sh` enabled. Your pairings
+and BlueZ config are left alone.
 
-- Unfortunately, if you ever stop or restart the program, you must completely remove the Bluetooth pairing between your iPhone and computer and redo the process of this Bullshitooth Emulator
-- If a certain input field in a program—such as the address bar in Chrome or Code windows in vscode—is focused by the mouse cursor, it may capture the mouse scroll events, preventing them from being delivered to your iPhone. If all other features are working normally but mouse scrolling doesn't, try changing the focus on your computer to a different, more neutral input field in another program, then try again.
-- \+ 2025.04.21
-  - In grab mode, add a suppress feature to prevent keyboard and mouse events from propagating to the computer.
-  - Fixed a bug where special characters above the number keys were not being transmitted.
-  - Also, fix the issue where the window closes immediately after running `start.sh`.
-- \+ 2025.04.23
-  - Enhanced internal keyboard input handling
-  - Changed shut down key set from {`ctrl` + `c`} to {`ctrl` + `shift` + `c`}
+Useful commands after `./install.sh`:
+
+```bash
+systemctl status toothkey-worker          # is the worker up?
+systemctl --user status toothkey-tray     # is the tray up?
+journalctl -u toothkey-worker -f          # follow worker logs
+./uninstall.sh                            # undo the install
+```
+
+## Running without installing
+
+If you'd rather not use systemd — e.g. for one-off use, development,
+or headless debugging — run it directly via `start.sh`:
+
+```bash
+git clone <this-repo> ~/toothkey
+cd ~/toothkey
+./start.sh
+```
+
+On first run, `start.sh` installs apt + Python dependencies, configures
+BlueZ, and launches the tray. On subsequent runs it just launches. It
+caches sudo credentials up front (needed to spawn the BT worker as
+root) and launches both the worker and the tray as detached processes.
+
+If Tooth-key has been installed via `./install.sh`, `./start.sh`
+detects the running systemd worker service and exits gracefully rather
+than spawning a second one. Use `--cli` to force terminal mode.
+
+Optional: add Tooth-key to your desktop application menu (useful even
+without `install.sh`):
+
+```bash
+./start.sh --install-launcher    # drops .desktop + icon into ~/.local/share
+./start.sh --uninstall-launcher  # remove it
+```
+
+## Usage
+
+1. **Launch**: just log in (installed mode) or run `./start.sh`. A
+   tooth icon appears in the system tray with a red X overlay while
+   disconnected.
+2. **Pair** (first time only): on your iPhone, go to
+   Settings → Bluetooth → tap `Tooth-key (<hostname>)`. Confirm the
+   numeric code on the phone. The Linux side auto-confirms. After the
+   first pair, the bond is remembered on both sides.
+3. **Reconnect** (subsequent runs): happens automatically, either from
+   the iPhone or from Tooth-key paging the iPhone.
+4. **Type**: left-click the tray icon (or use the menu's Grab
+   keyboard) to start forwarding keys to the iPhone. The tooth turns
+   green, a floating tooth appears top-right, and a toast confirms.
+   Left-click again (or click the floating tooth) to ungrab.
+5. **Exit**: tray menu → Exit. Cleanly drops the Bluetooth link so the
+   iPhone shows "Not Connected" immediately.
+
+### Tray menu
+
+| Item                       | When shown         | Effect |
+|---------------------------|--------------------|--------|
+| Disconnect _device-name_  | While connected    | Drops the current link; app stays listening for reconnects. |
+| Grab keyboard             | While ungrabbed    | Start forwarding key events to the Bluetooth peer. |
+| Ungrab keyboard           | While grabbed      | Stop forwarding; keys reach local apps again. |
+| Open log folder           | Always             | Opens `logs/` in your file manager. |
+| Restart                   | Always             | Clean stop + start. Uses `systemctl` in installed mode, re-execs `start.sh` otherwise. |
+| Exit                      | Always             | Clean disconnect + quit. |
+
+### Keyboard shortcuts
+
+None. Grab/ungrab and quitting are controlled exclusively through the
+tray menu (and the floating grab indicator), so every key you press
+while grab mode is on is forwarded verbatim to the Bluetooth peer —
+no combos are intercepted locally.
+
+## Log files
+
+All logs live in the `logs/` subdirectory of the repo. They are
+appended to across runs (not rotated) — delete them manually if they
+get large, or run `./debug.sh` which truncates them before capture.
+
+| File                       | Written by | Purpose |
+|---------------------------|------------|---------|
+| `toothkey.log`            | worker + tray | Main combined log. Timestamped stdout/stderr of both processes plus uncaught exceptions. This is the file you want 99% of the time. |
+| `worker-diag.log`         | worker     | Low-level, unbuffered diagnostic trace written directly by the worker (bypasses normal logging). Used to catch crashes that happen before `toothkey.log` is even open. |
+| `tray-diag.log`           | tray       | Same idea, but for the tray process — captures early-startup failures (missing imports, no DISPLAY, Qt init errors). |
+| `worker-bootstrap.log`    | start.sh   | Captures stdout/stderr of the `sudo …python3 worker.py` subprocess during `start.sh`'s launch sequence. Useful when the worker dies before the socket is created. |
+| `tray-bootstrap.log`      | start.sh   | Same, for the tray subprocess. |
+| `tray-exit.log`           | start.sh   | Timestamped record of the tray subprocess's exit status. Useful to tell "tray never ran" from "tray ran and quit". |
+| `bluetoothd.log`          | debug.sh   | `journalctl -u bluetooth` capture. Only present after a `./debug.sh` run. |
+| `hci_monitor.log`         | debug.sh   | `btmon` HCI-level capture. Only present after a `./debug.sh` run. |
+| `toast-last.png`          | tray       | Diagnostic dump of the most recent toast notification (used to debug Wayland compositing of the grab toast). |
+
+In installed (systemd) mode, the worker's output is also captured in
+`journalctl -u toothkey-worker` and the tray's in
+`journalctl --user -u toothkey-tray`, in addition to `toothkey.log`.
+
+## Command-line reference
+
+`./start.sh` accepts exactly one flag at a time:
+
+| Flag                   | Purpose |
+|------------------------|---------|
+| _(none)_               | Launch the tray app; on first run install deps + configure BlueZ. |
+| `--cli`                | Launch in terminal mode (no tray). Useful for headless debugging or when installed mode is active but you want a one-off terminal run. |
+| `--reset-all`          | Reinstall apt dependencies, reinitialise BlueZ, then launch. |
+| `--reset-bluez`        | Reinitialise BlueZ (systemd unit, plugin blocklist, `main.conf` Class) and exit. |
+| `--reset-pairings`     | Drop every BlueZ bond on this machine (useful when a pair is stuck); exit. Remember to "Forget This Device" on the iPhone too. |
+| `--debug-on`           | Enable `bluetoothd -d` debug logging and restart the service. |
+| `--debug-off`          | Disable `bluetoothd` debug. |
+| `--install-launcher`   | Install the app into `~/.local/share/applications` + icon. |
+| `--uninstall-launcher` | Remove the launcher + icon. |
+| `-h`, `--help`         | Help. |
+
+## Troubleshooting
+
+- **Pairing fails with "Pairing Unsuccessful" on iPhone**
+  - Run `./start.sh --reset-pairings` _and_ "Forget This Device" on the
+    iPhone, then retry. Stale bonds on either side are the most common
+    cause.
+  - If it still fails, run `./debug.sh --isolate`. This captures a
+    full `bluetoothd` + HCI trace into `logs/bluetoothd.log`,
+    `logs/hci_monitor.log`, and `logs/toothkey.log`.
+
+- **App doesn't appear in system tray on Ubuntu GNOME**
+  - GNOME hides legacy tray icons. Install and enable the
+    [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/);
+    log out and back in.
+
+- **Red X stays on the icon forever**
+  - The iPhone hasn't reconnected. Tap `Tooth-key (…)` in iOS
+    Settings → Bluetooth. If nothing happens, toggle Bluetooth off/on
+    on the iPhone.
+
+- **Grab doesn't capture my keys**
+  - On X11, `pynput`'s key capture needs access to the display. The
+    tray runs `xhost +SI:localuser:root` at startup so the (root)
+    worker can open the display. Verify with `xhost` that the
+    `localuser:root` entry is present.
+  - On pure Wayland sessions some keys may not be capturable; fall
+    back to an X11 session.
+
+- **"Worker unreachable: … No such file or directory" (installed mode)**
+  - The worker service isn't running. Check
+    `systemctl status toothkey-worker` and
+    `journalctl -u toothkey-worker -n 50` for the failure reason.
+
+## How it works (briefly)
+
+- Registers a **BlueZ HID profile** (UUID `0x1124`) over D-Bus, with the
+  kernel handling L2CAP channels 0x0011 (control) and 0x0013 (interrupt).
+- Serves the HID **SDP record** (`hid_sdp_record.xml`) describing a
+  standard boot-protocol keyboard.
+- Locks the adapter's **Class of Device** to `0x002540`
+  (Peripheral + Keyboard) and blocks the BlueZ plugins (`input`,
+  `hostname`, `a2dp`, …) that would otherwise pollute the adapter's
+  advertised service classes and make iOS refuse HID pairing.
+- Implements a D-Bus **pairing agent** with `DisplayYesNo` capability
+  so SSP resolves to Numeric Comparison, which iOS requires for HID.
+- **Initiates pairing from our side** via `Device1.Pair()` the instant
+  the iPhone's ACL comes up — iOS waits for the peripheral to kick
+  off authentication on classic HID, without which it silently times
+  out.
+- **Auto-reconnects** via `Device1.Connect()` whenever a known-bonded
+  peer goes away, on a slow exponential backoff so it's ready the
+  moment the iPhone is reachable again.
+- **Cleanly disconnects** via `Device1.Disconnect()` on shutdown so
+  subsequent launches reconnect without waiting for iOS's 40-second
+  supervision timeout.

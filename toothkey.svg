@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tooth-key tray icon. Simple chunky tooth silhouette with a bold "K".
+  Designed for legibility down to 16x16 in a system tray.
+
+  Palette:
+    tooth fill     #f6f0d6  (warm off-white, reads as "tooth enamel")
+    tooth outline  #152a3a  (near-black navy, strong at small sizes)
+    letter K       #152a3a  (same outline colour for contrast)
+
+  The disconnected-state red X overlay is painted at runtime (see tray.py)
+  rather than baked into this file, so we only ship one asset.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!--
+    Tooth silhouette. Two tapered roots on top, bulbous crown on the bottom.
+    Drawn as a single closed path so it scales cleanly.
+  -->
+  <path
+    d="M 20 5
+       Q 15 3 13 8
+       L 14 28
+       Q 8 32 7 40
+       Q 6 54 18 59
+       Q 26 61 30 54
+       Q 32 52 34 54
+       Q 38 61 46 59
+       Q 58 54 57 40
+       Q 56 32 50 28
+       L 51 8
+       Q 49 3 44 5
+       L 41 9
+       L 36 26
+       Q 34 27 32 26
+       Q 30 27 28 26
+       L 23 9 Z"
+    fill="#f6f0d6"
+    stroke="#152a3a"
+    stroke-width="3"
+    stroke-linejoin="round"
+    stroke-linecap="round"/>
+
+  <!--
+    Letter K, centred in the crown. Using a system sans-serif black weight
+    so it looks similarly chunky even if a specific font isn't installed.
+  -->
+  <text
+    x="32" y="53"
+    text-anchor="middle"
+    font-family="'Arial Black','Helvetica Neue',Helvetica,Arial,sans-serif"
+    font-weight="900"
+    font-size="36"
+    fill="#152a3a">K</text>
+</svg>

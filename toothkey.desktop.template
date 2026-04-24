@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Tooth-key
+GenericName=Bluetooth Keyboard Bridge
+Comment=Exposes this machine's keyboard to paired devices over Bluetooth HID
+# %REPO% is replaced with the absolute path to the repo root at install
+# time (`./start.sh --install-launcher`).
+Exec=%REPO%/start.sh
+Icon=toothkey
+Terminal=false
+Categories=Utility;Network;
+StartupNotify=false
+Keywords=bluetooth;keyboard;hid;pairing;

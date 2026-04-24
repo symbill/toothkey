@@ -2,7 +2,7 @@ import json
 
 KEYBOARD_HID_USAGE_ID_MAP_JSON = 'keyboard_hid_usage_id_map.json'
 
-class BullshitKeyboardMap:
+class ToothkeyKeyboardMap:
 
     map:dict = None
 

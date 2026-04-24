@@ -1,5 +1,5 @@
 venv
-log
+logs
 *.cache
 *.initiated
 .vscode
