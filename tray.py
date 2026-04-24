@@ -1184,10 +1184,23 @@ class Tray(QObject):
         # group so it outlives the dying Qt event loop. We deliberately
         # don't wait for it — start.sh's own kill_previous_instances
         # step will gracefully take us out once we're gone.
-        if getattr(self, '_restart_on_quit', False):
+        restart = bool(getattr(self, '_restart_on_quit', False))
+        if restart:
             self._spawn_restart()
         self.tray.hide()
-        self.app.quit()
+        # Exit code signalling to systemd-user (installed mode):
+        #   0  => "user clicked Restart" (or old start.sh fallback) —
+        #         we want toothkey-tray.service to respawn.
+        #   42 => "user clicked Exit" — carved out of the unit's
+        #         Restart=always via RestartPreventExitStatus=42 so
+        #         systemd leaves us dead.
+        # Exit codes other than 42 (crash, SIGTERM from pkill, OOM…)
+        # will also trigger Restart=always — so `pkill toothkey`
+        # correctly bounces the tray rather than killing it for good.
+        # In non-installed mode (TOOTHKEY_INSTALLED unset, started
+        # via start.sh) the exit code is only observed by start.sh's
+        # tray-exit.log, so the choice here is harmless either way.
+        self.app.exit(0 if restart else 42)
 
     def _spawn_restart(self) -> None:
         """Bring Toothkey back up cleanly after a Restart click.
@@ -1211,50 +1224,50 @@ class Tray(QObject):
             self._spawn_restart_start_sh()
 
     def _spawn_restart_installed(self) -> None:
-        """Systemd-managed restart path. Fires off two systemctl calls
-        (one system, one --user) and exits; systemd respawns both.
+        """Systemd-managed restart path.
+
+        Flow:
+          1. Synchronously ask systemd to restart the worker (system
+             unit). The sudoers NOPASSWD drop-in written by install.sh
+             makes this silent. `systemctl restart` blocks until the
+             unit is back to active, so by the time this call returns
+             we know a fresh worker is listening on /run/toothkey/ipc.sock.
+          2. Return to _quit_now, which calls app.exit(0). That exit
+             status is NOT in toothkey-tray.service's
+             RestartPreventExitStatus=42, and the unit has
+             Restart=always, so systemd-user will respawn the tray
+             within RestartSec.
+
+        We deliberately do NOT schedule our own tray restart via
+        `systemctl --user restart` — an earlier iteration did this
+        via `bash -c 'sleep 1 && exec systemctl …'`, but that detached
+        child inherits our cgroup and gets killed along with the tray
+        when the unit goes inactive, so the restart never fires.
+        Letting systemd handle our respawn is both simpler and
+        race-free.
         """
-        # 1. Ask systemd (system bus) to restart the worker. This runs
-        #    under the sudoers NOPASSWD drop-in that install.sh wrote,
-        #    so it completes with no password prompt.
         try:
-            subprocess.Popen(
+            subprocess.run(
                 ['sudo', '-n', 'systemctl', 'restart',
                  'toothkey-worker.service'],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True,
+                timeout=10.0, check=False,
             )
-            print('[tray] restart (installed): spawned '
-                  'sudo -n systemctl restart toothkey-worker.service')
+            print('[tray] restart (installed): sudo -n systemctl '
+                  'restart toothkey-worker.service -> done')
+        except subprocess.TimeoutExpired:
+            print('[tray] restart (installed): worker restart '
+                  'timed out after 10s; continuing anyway')
         except Exception as e:
-            print(f'[tray] restart worker spawn failed: '
-                  f'{type(e).__name__}: {e}')
-            # Continue anyway — user may still want the tray to restart.
-
-        # 2. Tray restart via the user bus. We schedule it as a
-        #    detached `sleep 1 && systemctl --user restart` so it
-        #    runs AFTER this process exits (otherwise systemd would
-        #    see us as still alive and refuse to respawn).
-        try:
-            subprocess.Popen(
-                ['bash', '-c',
-                 'sleep 1 && exec systemctl --user restart '
-                 'toothkey-tray.service'],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            print('[tray] restart (installed): scheduled '
-                  'systemctl --user restart toothkey-tray.service')
-        except Exception as e:
-            print(f'[tray] restart tray spawn failed: '
-                  f'{type(e).__name__}: {e}')
-            self.tray.showMessage(
-                'Tooth-key', f'Restart spawn failed: {e}',
-                QSystemTrayIcon.Critical, 8000)
+            print(f'[tray] restart (installed): worker restart '
+                  f'failed: {type(e).__name__}: {e}')
+            # Continue anyway — user may still want the tray to cycle,
+            # and systemd-worker's own Restart=always will eventually
+            # bring the worker back.
+        print('[tray] restart (installed): exiting — systemd will '
+              'respawn toothkey-tray.service (Restart=always)')
 
     def _spawn_restart_start_sh(self) -> None:
         """Non-installed fallback: re-exec ./start.sh with a GUI

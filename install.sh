@@ -199,7 +199,22 @@ Type=simple
 WorkingDirectory=$SCRIPT_DIR
 Environment=TOOTHKEY_INSTALLED=1
 ExecStart=$PYTHON3 -u $SCRIPT_DIR/tray.py --socket /run/toothkey/ipc.sock
-Restart=on-failure
+
+# Restart policy:
+#   Restart=always               => tray comes back on any exit
+#                                   except the explicitly-excluded
+#                                   code below. Covers crashes,
+#                                   `pkill toothkey`, SIGTERM from
+#                                   session logout/login, and the
+#                                   tray menu's Restart click.
+#   RestartPreventExitStatus=42  => carved-out code the tray uses
+#                                   when the user picks "Exit" from
+#                                   the menu. We do NOT want to
+#                                   respawn in that case.
+# Keeping these two in lockstep with tray.py's _quit_now()'s exit
+# code contract is what makes Exit/Restart/pkill all behave sanely.
+Restart=always
+RestartPreventExitStatus=42
 RestartSec=2
 
 [Install]

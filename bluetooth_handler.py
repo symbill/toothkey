@@ -1367,6 +1367,16 @@ class ToothkeyHandler:
                 continue
 
             # --- Pick cadence based on how long we've been disconnected
+            # We use `session_start` (monotonic time of disconnect) to
+            # decide cadence. Crucially, `session_start` gets reset
+            # below whenever a page SUCCEEDS (ACL up) even if HID fails
+            # to open — because a successful page is proof the peer is
+            # reachable again, which drops us out of "patient" mode and
+            # back into aggressive retries. Without that reset we'd
+            # sit on a 3-minute wait after the first page-succeeds-
+            # but-HID-refused event, which is exactly the failure mode
+            # that manifested as "took ~3 extra minutes to reconnect
+            # after coming back into range".
             disconnected_for = now - session_start
             if disconnected_for < 60.0:
                 retry_after_success = 15.0   # aggressive burst
@@ -1407,6 +1417,21 @@ class ToothkeyHandler:
                         and cls._running
                         and cls._peer_acl_connected(mac)):
                     cls._try_open_hid_outbound(mac)
+
+                # Peer was reachable this round (ACL came up). Treat
+                # this as a *fresh* disconnect window for cadence
+                # purposes — we want aggressive 15s retries now, not
+                # patient 180s, because the most likely reason this
+                # attempt didn't fully succeed is that iOS hadn't
+                # committed to reopen HID yet and just needs another
+                # nudge in a few seconds.
+                if disconnected_for >= 60.0:
+                    _tlog(f'[reconnect] {mac}: peer back in range — '
+                          f'resetting cadence to aggressive (was '
+                          f'{retry_after_success:.0f}s)')
+                session_start = time.monotonic()
+                disconnected_for = 0.0
+                retry_after_success = 15.0
 
                 # Step 3: continue waiting. If wait_for_client adopted
                 # the outbound sockets (or accepted a fresh inbound
