@@ -465,17 +465,27 @@ class Toast(QWidget):
     def __init__(self, parent: QObject = None):
         # Window-type choice has a tricky history here:
         #
-        #   Qt.Tool / Qt.SplashScreen: reliably mapped on X11 + Wayland,
-        #     BUT on Plasma Wayland kwin ignores client-driven move()
-        #     for these roles and auto-places them (top-right corner),
-        #     so we couldn't centre the toast despite Qt reporting the
-        #     correct geometry internally.
+        #   Qt.Tool / Qt.SplashScreen: reliably skipped from the
+        #     taskbar, BUT have failure modes on both X11 and
+        #     Wayland — on Plasma Wayland kwin ignores client-
+        #     driven move() and auto-places them (top-right); on
+        #     X11 + KDE we've also seen the surface go fully
+        #     invisible (frameless + tool with WS_OnTop produces
+        #     a present-but-unmapped window in some kwin builds).
         #
-        #   Qt.Dialog: also reliably mapped, and kwin DOES honour
-        #     client-driven positioning for dialog-role surfaces.
-        #     By default dialogs are modal; we drop that with
-        #     WindowModality=NonModal and the NotModal hint.
-        #     This is the current choice.
+        #   Qt.Dialog: reliably mapped AND positioning works on
+        #     both display servers — but on KDE/Plasma X11 it
+        #     also gets a (transient) taskbar entry while visible.
+        #
+        # Solution: stay on Qt.Dialog for visibility + positioning
+        # reliability, then override the X11 _NET_WM_WINDOW_TYPE
+        # hint to NOTIFICATION via WA_X11NetWmWindowTypeNotification.
+        # KWin's taskbar manager skips windows whose first NET-WM
+        # type is NOTIFICATION, so the entry disappears, but Qt
+        # still treats us as a Dialog internally so positioning
+        # and mapping stay correct. The attribute is a no-op on
+        # Wayland (no _NET_WM_WINDOW_TYPE there), so the existing
+        # Wayland behaviour is unchanged.
         super().__init__(
             None,
             Qt.Dialog
@@ -485,6 +495,16 @@ class Toast(QWidget):
         self.setWindowModality(Qt.NonModal)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_AlwaysStackOnTop, True)
+        # X11-only: identifies the surface as a notification to
+        # the WM. KWin uses this to skip the taskbar entry while
+        # leaving stacking / positioning untouched.
+        try:
+            self.setAttribute(Qt.WA_X11NetWmWindowTypeNotification, True)
+        except AttributeError:
+            # Older PyQt builds may not expose this attribute. The
+            # toast still renders correctly; we just lose the
+            # taskbar-skip on those.
+            pass
         # NO WA_TranslucentBackground: we paint a fully opaque pill
         # and live with square window corners. Per-pixel alpha on a
         # SplashScreen-role surface isn't reliable across compositors.

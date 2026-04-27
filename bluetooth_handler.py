@@ -264,6 +264,59 @@ class ToothkeyHandler:
     _accept_wake_r:int = -1
     _accept_wake_w:int = -1
 
+    # --- Phantom-session detection --------------------------------
+    # When we peripheral-initiate the HID L2CAPs (after iOS has aged
+    # the bond's HID side out — typically after a long reconnect-
+    # storm of "page failed errno=112"), the iOS BT kernel may accept
+    # both PSM 0x11 + 0x13 at the link level WITHOUT promoting them
+    # to a HID Host session. Result: both sides "look connected", but
+    # iOS shows the on-screen keyboard in text fields and discards
+    # any HID input reports we send.
+    #
+    # The signal we use to distinguish a real HID-bound session
+    # from a phantom one is whether iOS sends ANY substantive
+    # (i.e. non-HANDSHAKE) transaction within the first few
+    # seconds. Empirically:
+    #
+    #   - Healthy session: at least SET_PROTOCOL (0x7X) within
+    #     ~100ms; sometimes also SET_IDLE / SET_REPORT depending
+    #     on the bond / iOS version. We have observed iPhones in
+    #     the wild that send ONLY SET_PROTOCOL on a perfectly
+    #     working session — so we cannot require more.
+    #   - Phantom session A (silent): no inbound traffic at all.
+    #   - Phantom session B (HANDSHAKE-only): iOS replies to our
+    #     HID-descriptor write with HANDSHAKE/INVALID_PARAM and
+    #     stops there.
+    #
+    # We deliberately do NOT try to identify the half-engaged
+    # "iOS sent SET_PROTOCOL but HID Host still isn't bound" mode
+    # from inbound traffic alone — empirically that case is wire-
+    # indistinguishable from the healthy SET_PROTOCOL-only case.
+    # Trying to detect it is what caused the disconnect/reconnect
+    # storm we hit when threshold was set to 2 distinct types.
+    #
+    # _session_substantive_types_seen accumulates the distinct
+    # transaction types (the high nibble) iOS has sent on the
+    # control channel in the current session, excluding HANDSHAKE.
+    # The phantom watchdog (started for outbound-initiated sessions
+    # only) waits _PHANTOM_DETECT_TIMEOUT_S and, if the set is
+    # still empty, tears the link down + force-disconnects the
+    # ACL so iOS clears its state and a fresh page can re-engage
+    # HID properly.
+    #
+    # Hard cap: the watchdog will only ever execute the teardown
+    # action up to _PHANTOM_TEARDOWN_MAX_PER_RUN times for the life
+    # of this worker process. Beyond that the watchdog disarms and
+    # logs but does not act, so a user-visible "Restart" is needed
+    # to re-arm. This protects against feedback loops where the
+    # watchdog and iOS get into a teardown-reconnect storm.
+    _session_substantive_types_seen:set = None
+    _session_started_outbound:bool = False
+    _phantom_thread:threading.Thread = None
+    _phantom_teardowns_this_run:int = 0
+    _PHANTOM_DETECT_TIMEOUT_S:float = 5.0
+    _PHANTOM_TEARDOWN_MAX_PER_RUN:int = 2
+
     connected:bool = False
     _running:bool = False
 
@@ -432,6 +485,7 @@ class ToothkeyHandler:
                     control_socket, interrupt_socket, mac = pending
                     ccs_addr = (mac, CONTROL_CHANNEL)
                     cis_addr = (mac, INTERRUPT_CHANNEL)
+                    cls._session_started_outbound = True
                     _bdiag(f'wait_for_client: adopted outbound HID '
                            f'sockets for {mac}')
                     break
@@ -466,6 +520,7 @@ class ToothkeyHandler:
                         cls._interrupt_server_socket.accept())
                     _bdiag(f'wait_for_client: interrupt accepted from '
                            f'{cis_addr}')
+                    cls._session_started_outbound = False
                     break
 
             if control_socket is None or interrupt_socket is None:
@@ -499,8 +554,15 @@ class ToothkeyHandler:
 
         cls.client_mac_address = ccs_addr[0]
         cls.save_client_mac_address_cache()
+        # Reset the per-session "iOS sent us a substantive HID
+        # transaction" set BEFORE flipping connected=True so any
+        # race with _watch_connection / _handle_control_transaction
+        # sees a clean slate. Use a fresh set instance (rather than
+        # .clear()) to avoid sharing references across sessions.
+        cls._session_substantive_types_seen = set()
         cls.connected = True
-        _bdiag(f'wait_for_client: connected=True client_mac={cls.client_mac_address}')
+        _bdiag(f'wait_for_client: connected=True client_mac={cls.client_mac_address} '
+               f'outbound={cls._session_started_outbound}')
 
         cls._watcher_thread = threading.Thread(target=cls._watch_connection, daemon=True)
         cls._watcher_thread.start()
@@ -518,6 +580,34 @@ class ToothkeyHandler:
             name='toothkey-hid-keepalive',
             daemon=True)
         cls._keepalive_thread.start()
+
+        # Phantom-session watchdog: only relevant when WE initiated
+        # the HID L2CAPs. Inbound accept means iOS opened the channels
+        # on its side, so its HID Host is by definition already in
+        # the loop. Outbound is the only path that can leave us with
+        # L2CAPs up but iOS silent on the wire.
+        #
+        # Also disarm once we've already torn down
+        # _PHANTOM_TEARDOWN_MAX_PER_RUN times this process — beyond
+        # that the watchdog is more likely a feedback-loop hazard
+        # than a useful recovery (we've seen iOS+bond combinations
+        # where healthy sessions and phantom sessions are wire-
+        # indistinguishable, so we must back off and trust the
+        # connection). User can re-arm via tray Restart.
+        if (cls._session_started_outbound and
+            cls._phantom_teardowns_this_run < cls._PHANTOM_TEARDOWN_MAX_PER_RUN):
+            cls._phantom_thread = threading.Thread(
+                target=cls._phantom_session_watchdog,
+                args=(cls.client_mac_address,),
+                name='toothkey-phantom-watch',
+                daemon=True)
+            cls._phantom_thread.start()
+        elif cls._session_started_outbound:
+            _bdiag(f'wait_for_client: phantom watchdog disarmed for '
+                   f'this run (already tore down '
+                   f'{cls._phantom_teardowns_this_run}/'
+                   f'{cls._PHANTOM_TEARDOWN_MAX_PER_RUN}) — '
+                   f'trusting the connection')
 
         return True
 
@@ -598,6 +688,32 @@ class ToothkeyHandler:
         header = data[0]
         t_type = (header >> 4) & 0x0F
         t_param = header & 0x0F
+
+        # Per-transaction debug log: lets us tell the difference
+        # between "iOS is doing real HID setup" (SET_PROTOCOL,
+        # SET_IDLE, SET_REPORT, GET_*) and "iOS only ack'd our
+        # descriptor write with a HANDSHAKE then went silent"
+        # (the phantom-session signature).
+        try:
+            from worker import _wdiag as _wd
+            _wd(f'[hid-rx] header=0x{header:02x} type={t_type:#x} '
+                f'param={t_param:#x} len={len(data)}')
+        except Exception:
+            pass
+
+        # Track the set of distinct non-HANDSHAKE transaction types
+        # iOS has sent in this session. The phantom watchdog gates
+        # on this set being non-empty — i.e. iOS sent at least one
+        # real HID Host transaction. HANDSHAKE alone doesn't count
+        # because iOS sends it as an INVALID_PARAM ack to our HID-
+        # descriptor write even when its HID Host never actually
+        # binds. Storing the full set (rather than a bool) keeps
+        # the diagnostic logging useful and lets us tighten the
+        # heuristic later without touching this code path.
+        if t_type != cls._HID_T_HANDSHAKE:
+            seen = cls._session_substantive_types_seen
+            if seen is not None:
+                seen.add(t_type)
 
         if t_type == cls._HID_T_HID_CONTROL:
             # SUSPEND / EXIT_SUSPEND / VIRTUAL_CABLE_UNPLUG. Spec says
@@ -711,6 +827,74 @@ class ToothkeyHandler:
             if not (cls._running and cls.connected):
                 break
             cls.send_to_interrupt_channel(cls._KEEPALIVE_REPORT)
+
+    @classmethod
+    def _phantom_session_watchdog(cls, mac_address:str):
+        """Detect and recover from "L2CAP up, HID down" iOS sessions.
+
+        Background: when our reconnect watchdog peripheral-initiates
+        the HID L2CAPs (PSM 0x11 + 0x13) after iOS has timed out the
+        keyboard side of the bond — typically following a long
+        reconnect-storm of "page failed errno=112: Host is down" —
+        the iOS BT kernel will accept both PSMs at the link level
+        but NOT promote them to a HID Host session. From our side
+        every send() succeeds and the socket stays open indefinitely,
+        but iOS silently drops every HID input report we transmit
+        and the on-screen keyboard pops up in text fields. Both ends
+        "look connected" because ACL + L2CAP are up.
+
+        Detection criterion: did iOS send any non-HANDSHAKE
+        transaction on the control channel within the detection
+        window? If yes → engaged, exit quietly. If no → silent or
+        HANDSHAKE-only → phantom, tear down.
+
+        We deliberately accept SET_PROTOCOL-only sessions as
+        healthy. Empirically some iOS bonds emit ONLY SET_PROTOCOL
+        on a perfectly working session, so requiring more
+        diversity caused false-positive teardown loops. The
+        watchdog also bumps _phantom_teardowns_this_run so the
+        spawn-side guard can disarm us after
+        _PHANTOM_TEARDOWN_MAX_PER_RUN actions — that's the
+        backstop against feedback loops in case our criterion is
+        still wrong on some other bond.
+        """
+        deadline = time.monotonic() + cls._PHANTOM_DETECT_TIMEOUT_S
+        while cls._running and cls.connected and time.monotonic() < deadline:
+            seen = cls._session_substantive_types_seen
+            if seen:
+                try:
+                    from worker import _wdiag as _wd
+                    types_hex = sorted(f'0x{t:x}' for t in seen)
+                    _wd(f'phantom-watch: {mac_address} engaged HID '
+                        f'(types={types_hex}) — exiting watchdog')
+                except Exception:
+                    pass
+                return
+            time.sleep(0.25)
+
+        if not (cls._running and cls.connected):
+            return
+
+        if cls._session_substantive_types_seen:
+            return
+
+        cls._phantom_teardowns_this_run += 1
+        _tlog(f'[phantom] {mac_address}: no substantive HID Host '
+              f'traffic in {cls._PHANTOM_DETECT_TIMEOUT_S:.1f}s '
+              f'(silence or HANDSHAKE-only) — iOS HID Host is not '
+              f'bound. Tearing link down so a fresh page can '
+              f're-engage. (teardown '
+              f'{cls._phantom_teardowns_this_run}/'
+              f'{cls._PHANTOM_TEARDOWN_MAX_PER_RUN} this run)')
+
+        # Drop our sockets first so iOS sees the L2CAP go away, then
+        # ask BlueZ to terminate the ACL. The order matters: closing
+        # our side first means iOS gets a clean L2CAP disconnect
+        # before we ask for ACL teardown, which gives its stack the
+        # best chance of rebuilding a proper HID session on the next
+        # page.
+        cls._drop_client()
+        cls._force_peer_acl_down(mac_address)
 
     @classmethod
     def _watch_connection(cls):
