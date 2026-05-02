@@ -1756,7 +1756,20 @@ class ToothkeyHandler:
                 # HID. Kick it off now so the iPhone sees SSP traffic
                 # within its internal timeout window and shows its pairing
                 # prompt instead of silently disconnecting.
-                cls._initiate_pairing(bus, str(path))
+                #
+                # Android, however, drives SSP from its own side when it
+                # pages us — calling Pair() here in parallel races the
+                # phone's bonding attempt and produces a 30s
+                # AUTH_FAILED. Skip the kickoff if the peer is already
+                # Connected when we first see it (phone-initiated ACL):
+                # only iOS reaches this callback with Connected=False
+                # because iOS pages us only after we've shown up in its
+                # scan list and we then have to drive auth ourselves.
+                already_connected = bool(dev.get('Connected'))
+                if already_connected:
+                    _tlog(f'[pair] skipping Device1.Pair() — peer paged us (Connected=True at appearance); letting it drive SSP')
+                else:
+                    cls._initiate_pairing(bus, str(path))
 
             def on_interfaces_removed(path, interfaces):
                 if 'org.bluez.Device1' in interfaces:
