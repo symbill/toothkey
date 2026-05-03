@@ -83,12 +83,49 @@ echo
 
 # Sanity-check the source tree. We're writing absolute paths into unit
 # files — better to fail now than to generate a broken service.
-for f in worker.py tray.py; do
+for f in worker.py tray.py start.sh; do
     if [ ! -f "$SCRIPT_DIR/$f" ]; then
         echo "ERROR: $SCRIPT_DIR/$f missing; can't reference it from systemd unit."
         exit 1
     fi
 done
+
+# ---------------------------------------------------------------------------
+# Prepare the system: apt packages + BlueZ configuration. This was
+# previously skipped by install.sh, which silently produced a worker
+# service that crash-looped on `import dbus` / `import gi` / etc. on a
+# machine that hadn't been bootstrapped via `./start.sh` first.
+#
+# We delegate to `start.sh --prepare-system` so the apt package list
+# and the bluez init logic have exactly one source of truth (in
+# start.sh's install_dependencies / init_bluez functions). That entry
+# point installs deps, writes /etc/bluetooth/main.conf Class, drops in
+# the bluetooth.service plugin override, and exits — it does NOT
+# launch the tray or worker (we'll do that ourselves below via
+# systemctl).
+#
+# Skip this if the caller passed --no-prepare (useful when iterating
+# on install.sh and you know the system is already prepared).
+# ---------------------------------------------------------------------------
+SKIP_PREPARE=0
+for arg in "$@"; do
+    if [ "$arg" = "--no-prepare" ]; then
+        SKIP_PREPARE=1
+    fi
+done
+
+if [ "$SKIP_PREPARE" -eq 0 ]; then
+    echo "Preparing system (apt deps + bluez config)..."
+    # We're already root from the sudo -E re-exec above, so start.sh's
+    # internal `sudo` calls are no-ops and won't prompt.
+    if ! bash "$SCRIPT_DIR/start.sh" --prepare-system; then
+        echo "ERROR: ./start.sh --prepare-system failed; not writing systemd units."
+        echo "       Fix the failure above (usually apt failing to install a"
+        echo "       package, or BlueZ not restarting) and re-run ./install.sh."
+        exit 1
+    fi
+    echo
+fi
 
 PYTHON3=$(command -v python3 || true)
 if [ -z "$PYTHON3" ]; then

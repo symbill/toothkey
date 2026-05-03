@@ -33,8 +33,11 @@ Now keyboard-only, more reliable persisted pairing, and a proper tray UI.
 - Python 3.10+
 - X11 or Wayland session (the tray needs a display)
 
-All Python / apt dependencies are installed automatically on first run
-of `start.sh` (which `install.sh` invokes internally).
+All Python / apt dependencies are installed automatically the first
+time you run either `./install.sh` or `./start.sh`. Both delegate to
+the same `install_dependencies` / `init_bluez` routines in `start.sh`,
+so there's one source of truth for the package list and the BlueZ
+configuration.
 
 ## Install
 
@@ -51,6 +54,10 @@ cd ~/toothkey
 
 `install.sh`:
 
+- runs `./start.sh --prepare-system` to install the apt + Python
+  dependencies and configure BlueZ (`main.conf` Class, plugin
+  blocklist drop-in). Pass `--no-prepare` if you've already done this
+  step manually and want to skip it.
 - writes `/etc/systemd/system/toothkey-worker.service`
   (BlueZ/HID worker, runs as root at boot)
 - writes `~/.config/systemd/user/toothkey-tray.service`

@@ -259,6 +259,7 @@ usage: $0 [flag]
     (no flag)            launch the tray app (first time: install deps + init bluez)
     --cli                launch in terminal-only mode (main.py, no tray)
     --reset-all          reinstall deps, reinit bluez, then launch the app
+    --prepare-system     install deps + init bluez (no launch); used by install.sh
     --reset-bluez        reinit bluez (systemd service + main.conf) and exit
     --reset-pairings     drop all linux-side BT pairings and exit
     --debug-on           enable bluetoothd debug (-d) and restart it; exit
@@ -299,6 +300,20 @@ case "$1" in
         install_dependencies
         init_bluez
         touch .initiated
+        ;;
+    --prepare-system)
+        # Headless one-shot: run install_dependencies + init_bluez and
+        # exit. Used by install.sh so the systemd-mode setup path has a
+        # single source of truth for the apt package list and the bluez
+        # configuration logic, instead of duplicating them. We do NOT
+        # touch the tray / launch path here — install.sh handles that
+        # via `systemctl --user enable --now toothkey-tray.service`.
+        echo "Preparing system: apt deps + bluez config..."
+        install_dependencies
+        init_bluez
+        touch .initiated
+        echo "System prepared."
+        exit 0
         ;;
     --reset-pairings)
         # One-shot: drop bonds and exit (matches --reset-bluez semantics).

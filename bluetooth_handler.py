@@ -362,22 +362,48 @@ class ToothkeyHandler:
         device_name = build_device_name()
         _bdiag(f'init: device_name={device_name!r}')
 
-        _bdiag('init: find_adapter')
-        adapter_path, cls.server_mac_address = cls.find_adapter(bus)
+        # Wait for an adapter to appear. After a controller wedge (e.g.
+        # firmware crash from too many failed pages) the kernel can take
+        # several seconds to expose hci0 again, especially when bluez was
+        # just restarted. On a cold boot with a USB dongle the wait can be
+        # even longer — btusb has to load firmware, bluez has to enumerate
+        # the controller, and only then does ProfileManager1 become usable.
+        # 10×1s was too tight: we observed worker crashes during normal
+        # autostart immediately after boot. 30×1s is still bounded and
+        # gives bluez a fair chance to come up before we declare the
+        # adapter missing. Without this wait we'd race straight into
+        # RegisterProfile with no adapter and crash with a misleading
+        # "Expected a string or unicode object" TypeError from python-dbus.
+        _bdiag('init: find_adapter (with retry)')
+        adapter_path, cls.server_mac_address = cls._find_adapter_with_retry(
+            bus, attempts=30, interval_s=1.0)
         cls._adapter_path = adapter_path
         _bdiag(f'init: adapter_path={adapter_path!r} mac={cls.server_mac_address!r}')
 
-        if adapter_path is not None:
-            # Before anything HCI-dependent (L2CAP bind, CoD write,
-            # profile register), make absolutely sure the adapter is
-            # powered. A DOWN adapter silently breaks every subsequent
-            # step in this function and leaves iOS stuck on "Connection
-            # Unsuccessful".
-            _bdiag('init: verify_adapter_powered')
-            cls._verify_adapter_powered(bus, adapter_path)
+        if adapter_path is None:
+            # Fail loudly *before* trying to register the agent/profile,
+            # so the worker logs an actionable hint instead of dying in
+            # python-dbus serialization with no clue why.
+            print('[adapter] FATAL: no bluez Adapter1 object present after '
+                  'retries. The Bluetooth controller is missing, rfkill\'d, '
+                  'or wedged. Try: `sudo rfkill unblock bluetooth && '
+                  'sudo systemctl restart bluetooth` — or, if that does not '
+                  'bring hci0 back, `sudo modprobe -r btusb && '
+                  'sudo modprobe btusb`. Check `dmesg | tail` for firmware '
+                  'load errors.')
+            raise RuntimeError(
+                'no bluez adapter available — refusing to register HID profile')
 
-            _bdiag('init: set_adapter_alias')
-            cls.set_adapter_alias(bus, adapter_path, device_name)
+        # Before anything HCI-dependent (L2CAP bind, CoD write,
+        # profile register), make absolutely sure the adapter is
+        # powered. A DOWN adapter silently breaks every subsequent
+        # step in this function and leaves iOS stuck on "Connection
+        # Unsuccessful".
+        _bdiag('init: verify_adapter_powered')
+        cls._verify_adapter_powered(bus, adapter_path)
+
+        _bdiag('init: set_adapter_alias')
+        cls.set_adapter_alias(bus, adapter_path, device_name)
 
         _bdiag('init: constructing ToothkeyAgent')
         ToothkeyAgent(bus)
@@ -1818,6 +1844,34 @@ class ToothkeyHandler:
                 mac_address = interfaces[BLUEZ_ADAPTER_INTERFACE]['Address']
                 return str(path), str(mac_address)
 
+        return None, None
+
+    @classmethod
+    def _find_adapter_with_retry(cls, bus:SystemBus,
+                                 attempts:int = 10,
+                                 interval_s:float = 1.0):
+        """Like find_adapter() but polls a few times. After a controller
+        firmware reset or a bluetoothd restart, GetManagedObjects() can
+        come back empty for a short window before hciN is re-exported.
+        We log the wait so it's obvious from the log why startup paused."""
+        import time
+        for i in range(attempts):
+            try:
+                path, mac = cls.find_adapter(bus)
+            except dbus.exceptions.DBusException as e:
+                # bluez itself may not be ready on the bus yet — treat
+                # this the same as "no adapter, try again".
+                path, mac = None, None
+                if i == 0:
+                    print(f'[adapter] bluez not ready yet ({e}); waiting…')
+            if path is not None:
+                if i > 0:
+                    print(f'[adapter] adapter appeared after {i*interval_s:.1f}s: {path}')
+                return path, mac
+            if i == 0:
+                print(f'[adapter] no adapter yet; will retry up to '
+                      f'{attempts} times every {interval_s:.1f}s')
+            time.sleep(interval_s)
         return None, None
 
     @staticmethod
