@@ -244,6 +244,22 @@ class ToothkeyHandler:
     # little while instead of being instantly undone.
     _reconnect_suppressed_until:float = 0.0
 
+    # Paused state: when True the user has explicitly said "stop
+    # talking to my iPhone until I say otherwise" via the tray's
+    # Pause menu item. Two effects:
+    #   1. The reconnect watchdog skips outbound paging entirely
+    #      (cf. _reconnect_suppressed_until, which is time-bounded
+    #      and only used by the regular Disconnect path).
+    #   2. wait_for_client accepts inbound iOS-initiated reconnects
+    #      and immediately drops them, so the iPhone can't bring
+    #      the link back up on its own either.
+    # _paused_name / _paused_mac snapshot the device label at the
+    # moment of pausing so the tray menu can show "Unpause <name>"
+    # even after _drop_client() nulls out client_display_name.
+    _paused:bool = False
+    _paused_name:str = None
+    _paused_mac:str = None
+
     # --- Churn-detection bookkeeping ------------------------------
     # Monotonic timestamp of our last outbound page attempt and the
     # last time the peer's ACL transitioned True->False, as observed
@@ -546,6 +562,28 @@ class ToothkeyHandler:
                         cls._interrupt_server_socket.accept())
                     _bdiag(f'wait_for_client: interrupt accepted from '
                            f'{cis_addr}')
+
+                    # Paused-state gate. The user explicitly told us to
+                    # stay quiet; iOS doesn't know that and may try to
+                    # reconnect from its side. Drop both freshly-
+                    # accepted sockets and loop back to select() — iOS
+                    # sees the link bounce and (usually) gives up.
+                    # Done after BOTH accepts so iOS gets a clean
+                    # symmetric close on both PSMs instead of a half-
+                    # open dangling 0x11.
+                    if cls._paused:
+                        _bdiag(f'wait_for_client: paused; dropping '
+                               f'inbound connect from {ccs_addr[0]}')
+                        print(f'[bluez] paused; dropping inbound '
+                              f'connect from {ccs_addr[0]}')
+                        for s in (control_socket, interrupt_socket):
+                            try: s.close()
+                            except OSError: pass
+                        control_socket = None
+                        interrupt_socket = None
+                        ccs_addr = cis_addr = None
+                        continue
+
                     cls._session_started_outbound = False
                     break
 
@@ -580,6 +618,13 @@ class ToothkeyHandler:
 
         cls.client_mac_address = ccs_addr[0]
         cls.save_client_mac_address_cache()
+        # Populate client_display_name from BlueZ so the tray menu
+        # shows e.g. "Disconnect John's iPhone" instead of
+        # "Disconnect AA:BB:CC:DD:EE:FF". on_interfaces_added does
+        # this for us during first-time pairing, but on every
+        # subsequent run the device is already known to BlueZ so
+        # InterfacesAdded never fires for it.
+        cls.client_display_name = cls._resolve_display_name(cls.client_mac_address)
         # Reset the per-session "iOS sent us a substantive HID
         # transaction" set BEFORE flipping connected=True so any
         # race with _watch_connection / _handle_control_transaction
@@ -990,6 +1035,62 @@ class ToothkeyHandler:
         cls._drop_client()
 
     @classmethod
+    def pause_client(cls):
+        """Pause the current peer: tear down ACL/L2CAP and pin the
+        auto-reconnect watchdog into 'idle' until the user explicitly
+        unpauses. Also makes wait_for_client refuse inbound iOS-
+        initiated reconnects (accept-then-close) so the link can't
+        sneak back up while the user thinks they're paused.
+
+        Snapshots the current device's display name + MAC into
+        `_paused_name` / `_paused_mac` BEFORE calling _drop_client,
+        because _drop_client clears client_display_name — and the
+        tray's "Unpause <name>" menu label needs the name to survive
+        the disconnect.
+        """
+        cls._paused_name = (
+            cls.client_display_name or cls.client_mac_address)
+        cls._paused_mac = cls.client_mac_address
+        cls._paused = True
+        cls._disconnect_all_devices()
+        cls._drop_client()
+        # Wake the reconnect watchdog so it observes _paused and
+        # parks on the long sleep, instead of waking up on its
+        # current timer and burning a page attempt before noticing.
+        cls._reconnect_wake.set()
+
+    @classmethod
+    def unpause_client(cls):
+        """Clear the pause flag, drop the time-based reconnect
+        suppression, and kick the watchdog so it pages the saved
+        peer immediately. The watchdog's outbound page lands a fresh
+        ACL + HID L2CAP pair, which wait_for_client adopts via the
+        usual _outbound_pending hand-off — same path as a normal
+        post-Disconnect reconnect.
+
+        No-op if we weren't paused; safe to call from a stale tray
+        click.
+        """
+        if not cls._paused:
+            return
+        cls._paused = False
+        cls._reconnect_suppressed_until = 0.0
+        cls._reconnect_wake.set()
+
+    @classmethod
+    def is_paused(cls) -> bool:
+        return cls._paused
+
+    @classmethod
+    def paused_device_label(cls) -> str:
+        """Best-effort display label for the paused device. Used by
+        the worker's state-broadcast so the tray can render
+        'Unpause <name>' even after _drop_client cleared the live
+        client_display_name. Falls back to the MAC if no friendly
+        name was ever resolved."""
+        return cls._paused_name or cls._paused_mac
+
+    @classmethod
     def wait_until_disconnected(cls):
         cls._disconnect_event.wait()
 
@@ -1144,6 +1245,49 @@ class ToothkeyHandler:
             return bool(props.Get('org.bluez.Device1', 'Connected'))
         except Exception:
             return False
+
+    @classmethod
+    def _resolve_display_name(cls, mac_address:str) -> str:
+        """Look up a peer's human-readable name from BlueZ.
+
+        Returns Device1.Name if set, else Device1.Alias, else the MAC
+        as a last-resort fallback. We need this on every (re)connect,
+        not just the first pairing: on subsequent runs the device
+        already exists in BlueZ's storage so no `InterfacesAdded`
+        signal fires, and the on_interfaces_added handler that
+        normally caches client_display_name never runs. Without this
+        helper the tray menu falls back to `Disconnect <MAC>` instead
+        of `Disconnect <peer name>`.
+        """
+        if not mac_address:
+            return mac_address or ''
+        bus = cls._bus
+        if bus is None:
+            return mac_address
+        dev_path = f'/org/bluez/hci0/dev_{mac_address.replace(":", "_")}'
+        try:
+            device = bus.get_object(BLUEZ_SERVICE_NAME, dev_path)
+            props = Interface(device, DBUS_PROPERTIES_INTERFACE)
+            # Name is the GAP-advertised friendly name; Alias is the
+            # user-overridable local label (Settings -> Bluetooth ->
+            # rename in KDE/GNOME). BlueZ guarantees Alias is always
+            # populated (it defaults to Name), so we read it last as
+            # a defence against a peer that didn't advertise Name.
+            try:
+                name = props.Get('org.bluez.Device1', 'Name')
+                if name:
+                    return str(name)
+            except dbus.exceptions.DBusException:
+                pass
+            try:
+                alias = props.Get('org.bluez.Device1', 'Alias')
+                if alias:
+                    return str(alias)
+            except dbus.exceptions.DBusException:
+                pass
+        except Exception as e:
+            _tlog(f'[name-lookup] {mac_address}: {type(e).__name__}: {e}')
+        return mac_address
 
     @classmethod
     def _try_outbound_reconnect(cls, mac_address:str) -> bool:
@@ -1517,6 +1661,15 @@ class ToothkeyHandler:
             if not mac:
                 cls._reconnect_wake.clear()
                 cls._reconnect_wake.wait(timeout=15.0)
+                continue
+
+            # Pause takes priority over every other gate. Park on a
+            # long sleep (woken early by unpause_client kicking
+            # _reconnect_wake) so we don't churn the loop while the
+            # user has explicitly told us to stay quiet.
+            if cls._paused:
+                cls._reconnect_wake.clear()
+                cls._reconnect_wake.wait(timeout=300.0)
                 continue
 
             now = time.monotonic()

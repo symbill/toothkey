@@ -20,6 +20,12 @@
 #      service without a password, so the tray's Restart menu item
 #      stays silent on click.
 #
+#   4. ~/.local/share/applications/toothkey.desktop + matching SVG icon
+#      Application-menu entry so "Tooth-key" shows up in the KDE /
+#      GNOME launcher / Activities. Delegates to
+#      `start.sh --install-launcher` so the .desktop format has a
+#      single source of truth.
+#
 # The script is idempotent — re-running it overwrites existing files
 # with fresh content. Use ./uninstall.sh to revert.
 #
@@ -193,7 +199,15 @@ ExecStart=$PYTHON3 -u $SCRIPT_DIR/worker.py --socket /run/toothkey/ipc.sock
 # user clicking Restart, or the user logging out and back in —
 # transparently gets a fresh worker. RestartSec=2 avoids a tight
 # loop if the worker is crashing immediately.
+#
+# RestartPreventExitStatus=42 carves out the "user clicked Exit in
+# the tray menu" path: tray sends `shutdown` over the UDS, worker
+# exits with 42, systemd leaves us dead. Mirrors the tray unit's own
+# RestartPreventExitStatus=42. Restart-via-tray still works because
+# tray.py follows up with an explicit `sudo systemctl restart
+# toothkey-worker.service`, which ignores RestartPreventExitStatus.
 Restart=always
+RestartPreventExitStatus=42
 RestartSec=2
 
 # journald + the worker's own logs/ files both get the output. This
@@ -291,7 +305,35 @@ fi
 echo "  wrote $SUDOERS_PATH"
 
 # ---------------------------------------------------------------------------
-# 4. Enable + (re)start the services.
+# 4. Application-menu entry. Drops a .desktop + SVG icon into
+# ~/.local/share so "Tooth-key" shows up in KDE / GNOME / XFCE
+# launchers next to every other GUI app on the box.
+#
+# We delegate to `start.sh --install-launcher`, run as the real user
+# with HOME pointed at their home dir, so the .desktop format / icon
+# layout has exactly one source of truth (start.sh's install_launcher
+# function). Failures here are non-fatal: a missing menu entry is a
+# UX regression, not a functional one — the autostarted tray will
+# still come up on next login.
+# ---------------------------------------------------------------------------
+echo "Installing application-menu entry..."
+USER_RUNTIME_DIR="/run/user/$REAL_UID"
+LAUNCHER_ENV=( "HOME=$REAL_HOME" )
+if [ -d "$USER_RUNTIME_DIR" ]; then
+    # kbuildsycoca6 (KDE) writes into XDG_RUNTIME_DIR — pass it
+    # through when it exists so the new .desktop is picked up
+    # without a re-login.
+    LAUNCHER_ENV+=( "XDG_RUNTIME_DIR=$USER_RUNTIME_DIR" )
+fi
+if sudo -u "$REAL_USER" "${LAUNCHER_ENV[@]}" \
+        bash "$SCRIPT_DIR/start.sh" --install-launcher; then
+    echo "  application-menu : Tooth-key entry installed"
+else
+    echo "  WARN: launcher install failed; tray will still autostart on login."
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Enable + (re)start the services.
 # ---------------------------------------------------------------------------
 echo
 echo "Enabling services..."
@@ -305,7 +347,6 @@ echo "  system-wide  : toothkey-worker.service (enabled, started)"
 # does whenever the user has an active login, but it doesn't from
 # e.g. an SSH session without lingering. Attempt enable and fall
 # back to a warning message if the user bus isn't reachable.
-USER_RUNTIME_DIR="/run/user/$REAL_UID"
 if [ -d "$USER_RUNTIME_DIR" ] \
    && sudo -u "$REAL_USER" XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" \
         systemctl --user daemon-reload 2>/dev/null; then

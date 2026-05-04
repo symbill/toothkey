@@ -20,10 +20,13 @@ re-invoked per tray restart.
 Protocol (one JSON object per line in both directions):
     worker -> tray:
         {"type":"hello","pid":<int>}
-        {"type":"state","connected":bool,"name":str|null,"mac":str|null,"grab":bool}
+        {"type":"state","connected":bool,"name":str|null,"mac":str|null,
+                       "grab":bool,"paused":bool}
         {"type":"shutdown_ack"}
     tray -> worker:
         {"type":"disconnect"}
+        {"type":"pause"}
+        {"type":"unpause"}
         {"type":"set_grab","on":bool}
         {"type":"shutdown"}
 
@@ -94,6 +97,13 @@ _shutdown = threading.Event()
 _out_lock = threading.Lock()
 _out_fh = None
 
+# Set to True when the tray sent us an explicit `shutdown` command
+# (i.e. user clicked Exit or Restart in the tray menu). Used to
+# choose our process exit code: 42 in that case, mirroring the
+# tray's exit-code contract. See the comment in the `shutdown`
+# branch of _command_reader and the return statement in main().
+_user_initiated_shutdown = False
+
 
 def _send(obj: dict) -> None:
     """Write one NDJSON line to the tray. No-op if not connected yet
@@ -115,11 +125,20 @@ def _send(obj: dict) -> None:
 
 
 def _current_state() -> dict:
+    paused = bool(ToothkeyHandler.is_paused())
+    # When paused-but-disconnected, ToothkeyHandler.client_display_name
+    # has been nulled by _drop_client. Fall back to the snapshot taken
+    # at pause time so the tray's "Unpause <name>" menu label keeps
+    # rendering with a real name instead of just "Unpause".
+    name = ToothkeyHandler.client_display_name
+    if name is None and paused:
+        name = ToothkeyHandler.paused_device_label()
     return {
         'connected': bool(ToothkeyHandler.is_connected()),
-        'name': ToothkeyHandler.client_display_name,
+        'name': name,
         'mac': ToothkeyHandler.client_mac_address,
         'grab': bool(GlobalContext.grab_mode),
+        'paused': paused,
     }
 
 
@@ -185,6 +204,12 @@ def _command_reader(rfh):
             elif t == 'disconnect':
                 print('[worker] command: disconnect')
                 ToothkeyHandler.disconnect_client()
+            elif t == 'pause':
+                print('[worker] command: pause')
+                ToothkeyHandler.pause_client()
+            elif t == 'unpause':
+                print('[worker] command: unpause')
+                ToothkeyHandler.unpause_client()
             elif t == 'set_grab':
                 on = bool(msg.get('on'))
                 print(f'[worker] command: set_grab({on})')
@@ -193,6 +218,17 @@ def _command_reader(rfh):
                 print('[worker] command: shutdown')
                 _send({'type': 'shutdown_ack'})
                 _shutdown.set()
+                # Mark this as a user-initiated shutdown so the
+                # process exits with status 42. Mirrors tray.py's
+                # contract: the worker's systemd unit lists 42 in
+                # RestartPreventExitStatus so the user clicking
+                # Exit doesn't get the worker auto-respawned
+                # underneath them. (Restart from the tray menu
+                # still works because the tray follows up with an
+                # explicit `sudo systemctl restart toothkey-worker`,
+                # which ignores RestartPreventExitStatus.)
+                global _user_initiated_shutdown
+                _user_initiated_shutdown = True
                 # Kick both subsystems so wait_for_client / pynput
                 # listener unblock and the BT main loop drops out.
                 ToothkeyKeyboardHandler.shutdown()
@@ -210,10 +246,10 @@ def _command_reader(rfh):
                 # goes away.
                 def _force_exit():
                     time.sleep(1.5)
-                    _wdiag('watchdog: forcing os._exit(0)')
+                    _wdiag('watchdog: forcing os._exit(42)')
                     print('[worker] forcing exit (main thread stuck in '
                           'accept)')
-                    os._exit(0)
+                    os._exit(42)
                 threading.Thread(target=_force_exit, daemon=True,
                                  name='shutdown-watchdog').start()
                 return
@@ -437,7 +473,11 @@ def main():
     try: os.unlink(args.socket)
     except OSError: pass
     print('[worker] exit')
-    return 0
+    # See comment on _user_initiated_shutdown above. If we got
+    # here because the tray asked us to stop, exit 42 so systemd
+    # leaves us dead (the tray will systemctl-restart us on a
+    # subsequent launcher click or menu Restart).
+    return 42 if _user_initiated_shutdown else 0
 
 
 if __name__ == '__main__':

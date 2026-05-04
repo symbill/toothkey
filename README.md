@@ -16,14 +16,27 @@ Now keyboard-only, more reliable persisted pairing, and a proper tray UI.
 - **Auto-reconnect** — if the iPhone drops off (out of range, sleep,
   etc.), Tooth-key pages it back automatically when it's reachable again.
 - **System-tray UI** — runs quietly in the tray with a tooth icon; a red
-  X overlay appears when disconnected, and the tooth turns green while
-  grab mode is on.
-- **Tray menu** with Disconnect / Grab / Ungrab / Open log folder /
-  Restart / Exit. Left-click toggles grab while connected; otherwise it
-  opens the menu.
+  X overlay appears when disconnected, a blue pause overlay appears
+  when paused, and the tooth turns green while grab mode is on.
+- **Tray menu** with Disconnect / Pause / Unpause / Grab / Ungrab /
+  Open log folder / Restart / Exit. Left-click toggles grab while
+  connected; otherwise it opens the menu.
+- **Pause mode** is "Disconnect, but for real" — like Disconnect, it
+  drops the current Bluetooth link, but it _also_ suppresses
+  auto-reconnect (both our outgoing pages and incoming iOS-initiated
+  reconnects are refused) until you explicitly **Unpause**. Use it
+  when you want to stop your iPhone from picking up keystrokes for
+  longer than the ~60 s window Disconnect gives you.
 - **Grab mode** suppresses keys from the host while forwarding them to
   the Bluetooth peer. A floating tooth appears at the top-right of the
   screen so you always know grab is active — click it to ungrab.
+- **Ctrl+V pastes the Linux clipboard into the iPhone.** While grab
+  mode is on, Ctrl+V is intercepted: instead of forwarding the chord
+  to iOS (which doesn't bind Ctrl+V to paste anyway — it expects
+  Cmd+V on hardware keyboards), Tooth-key reads the desktop clipboard
+  via `xclip` / `wl-paste` and types its contents into the BT peer
+  one HID keystroke at a time. The only practical way to ferry text
+  out of a Linux app and into an iOS text field over Bluetooth.
 - **Clean disconnect on exit** so iOS doesn't hold a stale link.
 
 ## Requirements
@@ -32,6 +45,9 @@ Now keyboard-only, more reliable persisted pairing, and a proper tray UI.
 - A working Bluetooth controller (BR/EDR — classic Bluetooth)
 - Python 3.10+
 - X11 or Wayland session (the tray needs a display)
+- `xclip` and/or `wl-clipboard` on the user's `$PATH` (auto-installed;
+  required for the Ctrl+V "paste desktop clipboard into iPhone"
+  feature — without them Ctrl+V silently does nothing)
 
 All Python / apt dependencies are installed automatically the first
 time you run either `./install.sh` or `./start.sh`. Both delegate to
@@ -65,6 +81,9 @@ cd ~/toothkey
 - writes `/etc/sudoers.d/toothkey` so your user can
   `systemctl {start,stop,restart} toothkey-worker.service` without a
   password (needed by the tray's Restart menu item)
+- drops a `.desktop` entry + SVG icon into `~/.local/share` so
+  Tooth-key shows up in your KDE / GNOME / XFCE application menu
+  (delegates to `start.sh --install-launcher`)
 - enables and starts both services
 
 The repo directory you cloned into becomes the permanent install
@@ -74,8 +93,8 @@ pick up code changes, either re-run `./install.sh` (safe to do
 repeatedly) or click Restart in the tray menu.
 
 To undo: `./uninstall.sh`. It removes the two services, the sudoers
-drop-in, and disables everything `install.sh` enabled. Your pairings
-and BlueZ config are left alone.
+drop-in, the application-menu entry, and disables everything
+`install.sh` enabled. Your pairings and BlueZ config are left alone.
 
 Useful commands after `./install.sh`:
 
@@ -106,8 +125,9 @@ If Tooth-key has been installed via `./install.sh`, `./start.sh`
 detects the running systemd worker service and exits gracefully rather
 than spawning a second one. Use `--cli` to force terminal mode.
 
-Optional: add Tooth-key to your desktop application menu (useful even
-without `install.sh`):
+The application-menu entry is installed automatically by `./install.sh`.
+If you're running `start.sh` directly (without installing) and want
+the same menu shortcut, manage it explicitly:
 
 ```bash
 ./start.sh --install-launcher    # drops .desktop + icon into ~/.local/share
@@ -136,19 +156,40 @@ without `install.sh`):
 
 | Item                       | When shown         | Effect |
 |---------------------------|--------------------|--------|
-| Disconnect _device-name_  | While connected    | Drops the current link; app stays listening for reconnects. |
-| Grab keyboard             | While ungrabbed    | Start forwarding key events to the Bluetooth peer. |
-| Ungrab keyboard           | While grabbed      | Stop forwarding; keys reach local apps again. |
+| Disconnect _device-name_  | Connected, not paused | Drops the current link; app stays listening for reconnects (auto-reconnect resumes after a ~60 s suppression window). |
+| Pause _device-name_       | Connected, not paused | Same teardown as Disconnect, but auto-reconnect stays off (no outbound paging, inbound iOS reconnects are refused) until Unpause. Tray icon flips to blue pause overlay. |
+| Unpause _device-name_     | While paused       | Clears the pause flag and pages the saved peer immediately to bring the link back up. Hidden in every other state. |
+| Grab keyboard             | Connected + ungrabbed | Start forwarding key events to the Bluetooth peer. |
+| Ungrab keyboard           | Connected + grabbed   | Stop forwarding; keys reach local apps again. |
 | Open log folder           | Always             | Opens `logs/` in your file manager. |
-| Restart                   | Always             | Clean stop + start. Uses `systemctl` in installed mode, re-execs `start.sh` otherwise. |
+| Restart                   | Always             | Clean stop + start. Uses `systemctl` in installed mode, re-execs `start.sh` otherwise. (Pause state does NOT survive a Restart — the new process starts un-paused and auto-reconnects.) |
 | Exit                      | Always             | Clean disconnect + quit. |
+
+The tray icon reflects link state at a glance:
+
+| Icon                       | Meaning |
+|---------------------------|---------|
+| Plain tooth               | Connected, grab off — keys go to local apps as usual. |
+| Green tooth               | Connected, grab on — keys are being forwarded to the iPhone. |
+| Tooth + red X             | Disconnected, auto-reconnect is trying to bring the link back up. |
+| Tooth + blue pause bars   | Paused — disconnected on purpose, auto-reconnect suppressed until you click Unpause. |
+| Faded tooth               | Shutting down (Exit / Restart in progress). |
 
 ### Keyboard shortcuts
 
-None. Grab/ungrab and quitting are controlled exclusively through the
-tray menu (and the floating grab indicator), so every key you press
-while grab mode is on is forwarded verbatim to the Bluetooth peer —
-no combos are intercepted locally.
+Almost none. Grab/ungrab and quitting are controlled exclusively
+through the tray menu (and the floating grab indicator), so every
+key you press while grab mode is on is forwarded verbatim to the
+Bluetooth peer — with one exception:
+
+| Chord (while grabbed) | What Tooth-key does |
+|------------------------|----------------------|
+| `Ctrl+V`              | **Special case.** Reads your Linux desktop clipboard (`xclip` on X11, `wl-paste` on Wayland) and types its contents into the iPhone as simulated keystrokes. The Ctrl+V chord itself is _not_ forwarded — iOS doesn't bind Ctrl+V to paste anyway (Cmd+V is the iOS hardware-keyboard chord), so the only practical effect is "the text I just copied on Linux now appears in the iOS text field". Non-typeable characters (most non-ASCII / control codes) are skipped. |
+
+Everything else — including `Ctrl+C`, `Cmd+V`, `Ctrl+Shift+V`,
+function keys, etc. — is forwarded as-is. If you want to send a
+literal Ctrl+V to the iPhone for some reason, ungrab first, focus
+the target app on iOS, then re-grab.
 
 ## Log files
 
@@ -185,7 +226,7 @@ In installed (systemd) mode, the worker's output is also captured in
 | `--reset-pairings`     | Drop every BlueZ bond on this machine (useful when a pair is stuck); exit. Remember to "Forget This Device" on the iPhone too. |
 | `--debug-on`           | Enable `bluetoothd -d` debug logging and restart the service. |
 | `--debug-off`          | Disable `bluetoothd` debug. |
-| `--install-launcher`   | Install the app into `~/.local/share/applications` + icon. |
+| `--install-launcher`   | Install the app into `~/.local/share/applications` + icon. (`./install.sh` does this for you automatically.) |
 | `--uninstall-launcher` | Remove the launcher + icon. |
 | `-h`, `--help`         | Help. |
 
@@ -221,6 +262,24 @@ In installed (systemd) mode, the worker's output is also captured in
   - The worker service isn't running. Check
     `systemctl status toothkey-worker` and
     `journalctl -u toothkey-worker -n 50` for the failure reason.
+
+- **Ctrl+V doesn't paste anything into the iPhone**
+  - Check `logs/toothkey.log` for a `[kbd] clipboard read failed: …`
+    line. The most common cause is `xclip` / `wl-paste` not being on
+    `$PATH`; install with `sudo apt install xclip wl-clipboard` and
+    grab again. Tooth-key tries `wl-paste` first when
+    `WAYLAND_DISPLAY` is set, then `xclip`, so installing both is the
+    safest option for mixed X11/Wayland setups.
+  - The clipboard read happens inside the (root) worker process,
+    using the `DISPLAY` / `WAYLAND_DISPLAY` / `XAUTHORITY` env vars
+    the tray forwarded over the IPC handshake. If the tray hasn't
+    connected yet (e.g. you triggered Ctrl+V immediately on launch
+    while the icon is still red-X) the worker logs
+    `clipboard read: no DISPLAY or WAYLAND_DISPLAY set` and bails.
+  - Non-ASCII characters (emoji, accented letters, CJK, etc.) aren't
+    typeable on a US-layout HID keyboard and are skipped with a
+    `paste: skipped N unmappable char(s)` log line. Plain ASCII
+    pastes verbatim.
 
 ## How it works (briefly)
 

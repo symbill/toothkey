@@ -7,7 +7,9 @@
 #   3. Stops + disables the toothkey-worker.service system unit.
 #   4. Removes /etc/systemd/system/toothkey-worker.service.
 #   5. Removes /etc/sudoers.d/toothkey.
-#   6. Runs `systemctl daemon-reload` so systemd forgets the units.
+#   6. Removes the application-menu entry + icon (delegates to
+#      `start.sh --uninstall-launcher`).
+#   7. Runs `systemctl daemon-reload` so systemd forgets the units.
 #
 # We intentionally do NOT touch:
 #   - /run/toothkey/       (ephemeral, gone on reboot anyway)
@@ -46,6 +48,8 @@ if [ -z "$REAL_USER" ] || [ "$REAL_USER" = "root" ]; then
 fi
 REAL_UID="${TOOTHKEY_UNINSTALL_INVOKER_UID:-$(id -u "$REAL_USER")}"
 REAL_HOME="${TOOTHKEY_UNINSTALL_INVOKER_HOME:-$(getent passwd "$REAL_USER" | cut -d: -f6)}"
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 echo "Uninstalling Toothkey autostart for user: $REAL_USER"
 echo
@@ -98,7 +102,24 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Daemon reload so systemd forgets the units.
+# 6. Remove the application-menu entry. Delegates to
+# `start.sh --uninstall-launcher` so the .desktop + icon paths stay in
+# one place. Run as the real user (not root) so $HOME resolves to
+# their home dir.
+# ---------------------------------------------------------------------------
+if [ -f "$SCRIPT_DIR/start.sh" ]; then
+    LAUNCHER_ENV=( "HOME=$REAL_HOME" )
+    if [ -d "$USER_RUNTIME_DIR" ]; then
+        LAUNCHER_ENV+=( "XDG_RUNTIME_DIR=$USER_RUNTIME_DIR" )
+    fi
+    sudo -u "$REAL_USER" "${LAUNCHER_ENV[@]}" \
+        bash "$SCRIPT_DIR/start.sh" --uninstall-launcher 2>/dev/null \
+        && echo "  removed application-menu entry" \
+        || echo "  (no application-menu entry to remove)"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. Daemon reload so systemd forgets the units.
 # ---------------------------------------------------------------------------
 systemctl daemon-reload
 

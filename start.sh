@@ -28,7 +28,13 @@ function install_dependencies() {
         python3 python3-pip \
         python3-pynput python3-dbus python3-gi python3-bluez \
         python3-pyqt5 python3-pyqt5.qtsvg \
-        python3-setproctitle
+        python3-setproctitle \
+        xclip wl-clipboard
+    # xclip + wl-clipboard back the Ctrl+V "paste desktop clipboard
+    # into iPhone via keystrokes" feature in keyboard_handler.py.
+    # Both are tiny and we install both so the same binary works on
+    # X11, Wayland, and mixed XWayland setups without sniffing the
+    # session type at runtime.
 }
 
 function ensure_main_conf_class() {
@@ -353,6 +359,75 @@ case "$1" in
         ;;
 esac
 
+# ---------------------------------------------------------------------------
+# Installed-mode short-circuit. If install.sh has dropped its system
+# unit file in /etc/systemd/system/, toothkey is being managed by
+# systemd: a system worker (root) and a user tray. We detect that by
+# file presence rather than `is-active`, because we need to handle
+# BOTH of these cases from a single launcher click:
+#
+#   A. Worker is running, tray is dead. User clicked Exit in the
+#      tray menu, which exited the user unit with code 42 (carved
+#      out of Restart=always). Tray respawn is what's needed.
+#
+#   B. Both worker and tray are dead. The worker also exits 42 on a
+#      tray-initiated shutdown now, and its unit lists 42 in
+#      RestartPreventExitStatus too. So after Exit, neither service
+#      is running. The launcher click has to revive both of them.
+#
+# We do this BEFORE the bluez / python-deps / xhost dance below for
+# two reasons:
+#
+#   1. A click on the application-menu .desktop launcher invokes
+#      ./start.sh with no args, no terminal (Terminal=false). If
+#      ensure_bluez_config_current decides the drop-in needs a
+#      restart it'll prompt for sudo via polkit -- confusing UX
+#      from a launcher click, and unnecessary since the system
+#      service already enforces the right BlueZ config.
+#
+#   2. ensure_python_deps / xhost / etc. are all aimed at the bare
+#      ./start.sh dev flow; in installed mode the worker's running
+#      under systemd and doesn't share our environment anyway.
+#
+# `--cli` still wins over installed mode: developer escape hatch.
+# ---------------------------------------------------------------------------
+if [ "${1:-}" != "--cli" ] \
+   && command -v systemctl >/dev/null 2>&1 \
+   && [ -f /etc/systemd/system/toothkey-worker.service ]; then
+    echo "Toothkey is installed as a systemd service; bringing it up..."
+
+    # Worker first: `systemctl restart` is idempotent on an active
+    # unit and resets a `failed` unit on the way to active, so it
+    # works whether the worker is running, stopped (Exit), or in a
+    # crashed-failed state. We use `sudo -n` because install.sh's
+    # sudoers drop-in whitelists exactly this command without a
+    # password prompt.
+    if sudo -n systemctl restart toothkey-worker.service 2>/dev/null; then
+        echo "  sudo -n systemctl restart toothkey-worker.service: ok"
+    else
+        echo "  WARN: sudo -n systemctl restart toothkey-worker.service failed."
+        echo "        (Sudoers drop-in missing? Re-run ./install.sh.)"
+    fi
+
+    # Tray second: needs the worker's UDS to exist already.
+    if systemctl --user restart toothkey-tray.service 2>/dev/null; then
+        echo "  systemctl --user restart toothkey-tray.service: ok"
+    else
+        # User bus not reachable (e.g. SSH session w/o lingering),
+        # or the unit isn't installed. Fall back to a useful message.
+        echo "  systemctl --user restart toothkey-tray.service: failed"
+        echo
+        echo "Useful commands:"
+        echo "  systemctl status toothkey-worker          # worker status"
+        echo "  systemctl --user status toothkey-tray     # tray status"
+        echo "  systemctl --user restart toothkey-tray    # reload the tray UI"
+        echo "  sudo systemctl restart toothkey-worker    # reload the BT worker"
+        echo "  ./uninstall.sh                            # disable autostart,"
+        echo "                                            # then ./start.sh works normally"
+    fi
+    exit 0
+fi
+
 # Idempotent: make sure main.conf has the right Class every launch. If the
 # sed actually changes something, restart bluetooth so bluez re-reads it.
 before=$(sha256sum /etc/bluetooth/main.conf 2>/dev/null || echo "")
@@ -384,8 +459,19 @@ function ensure_python_deps() {
             missing+=("$mod")
         fi
     done
+
+    # Clipboard helpers used by the Ctrl+V "paste desktop clipboard
+    # into iPhone" feature in keyboard_handler.py. Treat them like a
+    # Python dep — if BOTH are missing, fall back to a full
+    # install_dependencies pass so this branch is reachable on
+    # already-`.initiated` machines after a code update.
+    if ! command -v xclip >/dev/null 2>&1 \
+       && ! command -v wl-paste >/dev/null 2>&1; then
+        missing+=("xclip|wl-clipboard")
+    fi
+
     if [ "${#missing[@]}" -gt 0 ]; then
-        echo "Missing python modules: ${missing[*]}"
+        echo "Missing dependencies: ${missing[*]}"
         echo "Re-running install_dependencies to catch up..."
         install_dependencies
     fi
@@ -454,29 +540,6 @@ function ensure_bluez_config_current() {
     fi
 }
 ensure_bluez_config_current
-
-# ---------------------------------------------------------------------------
-# If install.sh has wired up toothkey as system + user systemd units,
-# we shouldn't double-launch. Detect an active worker service and
-# bail with a friendly message. Still allow `./start.sh --cli` to
-# override, since that's a developer debug flow and the user opted in.
-# ---------------------------------------------------------------------------
-if [ "${1:-}" != "--cli" ] \
-   && command -v systemctl >/dev/null 2>&1 \
-   && systemctl is-active --quiet toothkey-worker.service 2>/dev/null; then
-    echo
-    echo "Toothkey is already running as a systemd service"
-    echo "  (installed via ./install.sh). Nothing for ./start.sh to do."
-    echo
-    echo "Useful commands:"
-    echo "  systemctl status toothkey-worker          # worker status"
-    echo "  systemctl --user status toothkey-tray     # tray status"
-    echo "  systemctl --user restart toothkey-tray    # reload the tray UI"
-    echo "  sudo systemctl restart toothkey-worker    # reload the BT worker"
-    echo "  ./uninstall.sh                            # disable autostart,"
-    echo "                                            # then ./start.sh works normally"
-    exit 0
-fi
 
 # --cli still runs main.py as root in the foreground (no tray, no
 # split). Useful for debugging and for headless setups that don't

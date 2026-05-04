@@ -1,10 +1,14 @@
 """Keyboard capture + HID report generation.
 
 All user-facing control (grab/ungrab, shutdown) is driven by the tray
-menu. This module deliberately has NO keyboard shortcuts of its own —
-every key pressed while grab_mode is on is forwarded verbatim to the
-connected Bluetooth host. That means there's no key combo the user
-could press that would fail to pass through to e.g. their iPhone.
+menu. With ONE exception — Ctrl+V — every key pressed while grab_mode
+is on is forwarded verbatim to the connected Bluetooth host. Ctrl+V
+is special-cased to "paste the Linux desktop clipboard into the BT
+peer as simulated keystrokes", because (a) iOS doesn't bind Ctrl+V to
+paste anyway (it expects Cmd+V on hardware keyboards) and (b) there
+is otherwise no easy way to ferry text from the Linux clipboard into
+an iPhone over a BT-HID link. See `_do_clipboard_paste` for the
+mechanics.
 
 Lifecycle:
     - `start()` spins up a pynput Listener in the current thread
@@ -29,9 +33,130 @@ Lazy-pynput rationale:
     WAYLAND_DISPLAY / XAUTHORITY / XDG_RUNTIME_DIR via the handshake.
 """
 
+import os
+import string
+import subprocess
 import threading
+import time
 
 from common import GlobalContext
+
+
+# US-QWERTY printable characters that require Shift to produce. Used
+# by the clipboard-paste synth path to decide whether to set the Shift
+# bit in the modifier byte before each per-character report. Keep this
+# in sync with `keyboard_hid_usage_id_map.json` — every shifted symbol
+# in the JSON map must have its base character listed here.
+_SHIFTED_PRINTABLE_CHARS = set('!@#$%^&*()_+{}|:"<>?~') | set(string.ascii_uppercase)
+
+# HID modifier-byte bit for left-shift. Mirrors the value in
+# `ToothkeyKeyboardHandler.modifier_key_bitmasks[Key.shift_l]`, but we
+# need it here as a literal because the synth path runs without going
+# through pynput's Key enum (and may run before pynput is loaded if the
+# clipboard read also fails).
+_HID_MOD_SHIFT_L = 1 << 1
+
+# Minimum gap between back-to-back HID reports during clipboard paste.
+# iOS's HID input driver de-duplicates reports that arrive within the
+# same Bluetooth transmission slot (~1.25 ms), so two distinct chars
+# sent too quickly merge into one keypress on the phone. Empirically,
+# 4 ms between EVERY edge (press AND release) is the floor where every
+# char in a 1k-char paste lands reliably; anything tighter loses chars
+# unpredictably mid-string. 4 ms × 2 edges/char ≈ 125 chars/sec,
+# which feels instant for typical password / URL pastes.
+_PASTE_INTERCHAR_DELAY_S = 0.004
+
+
+def _read_desktop_clipboard():
+    """Read text from the user's desktop clipboard via xclip / wl-paste.
+
+    The worker process inherits DISPLAY / WAYLAND_DISPLAY / XAUTHORITY
+    from the tray's `client_hello` handshake, so the same env vars
+    pynput uses for keyboard grab are also what xclip/wl-paste need
+    to reach the user's session. Returns the decoded clipboard text,
+    or None if both helpers are unavailable / errored / empty.
+    """
+    # Wayland sessions keep the Wayland clipboard separate from the
+    # XWayland (X11) clipboard, and the user's "real" copy lives in
+    # the Wayland one — so try wl-paste first when WAYLAND_DISPLAY
+    # is set, falling back to xclip if it's missing or returns empty.
+    candidates = []
+    if os.environ.get('WAYLAND_DISPLAY'):
+        candidates.append(['wl-paste', '--no-newline'])
+    if os.environ.get('DISPLAY'):
+        candidates.append(['xclip', '-selection', 'clipboard', '-out'])
+
+    if not candidates:
+        print('[kbd] clipboard read: no DISPLAY or WAYLAND_DISPLAY set; '
+              'tray handshake may not have happened yet')
+        return None
+
+    last_err = None
+    for cmd in candidates:
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, timeout=2.0)
+        except FileNotFoundError:
+            last_err = (f'{cmd[0]} not installed; '
+                        'apt install xclip wl-clipboard')
+            continue
+        except subprocess.TimeoutExpired:
+            last_err = f'{cmd[0]} timed out after 2s'
+            continue
+        except Exception as e:
+            last_err = f'{cmd[0]}: {type(e).__name__}: {e}'
+            continue
+
+        if r.returncode != 0:
+            # xclip prints "Error: target STRING not available" to
+            # stderr when the clipboard is empty or holds non-text;
+            # surface it but keep trying further candidates.
+            err = r.stderr.decode('utf-8', errors='replace').strip()
+            last_err = f'{cmd[0]} rc={r.returncode}: {err or "(no stderr)"}'
+            continue
+
+        try:
+            text = r.stdout.decode('utf-8')
+        except UnicodeDecodeError:
+            text = r.stdout.decode('latin-1', errors='replace')
+        if text:
+            return text
+        last_err = f'{cmd[0]}: clipboard empty'
+
+    if last_err:
+        print(f'[kbd] clipboard read failed: {last_err}')
+    return None
+
+
+def _char_to_hid(c: str):
+    """Map a single character to (hid_usage_id, needs_shift), or None
+    if the character can't be typed on a US-layout HID keyboard.
+
+    Newlines map to Enter (HID 40) and tabs map to Tab (HID 43); other
+    control characters and any non-ASCII / unmapped Unicode codepoint
+    are reported as untypeable (caller logs + skips). This is the
+    same general philosophy as a USB keyboard: only chars that have a
+    physical-key analogue make it through.
+    """
+    # Enter / line breaks. Treat \r the same as \n so CRLF clipboards
+    # (common when the source app is a Windows tool over RDP, or any
+    # text copied out of a terminal that retained CR) don't double-tap.
+    if c in ('\n', '\r'):
+        return (40, False)
+    if c == '\t':
+        return (43, False)
+    if c == ' ':
+        return (44, False)
+
+    needs_shift = c in _SHIFTED_PRINTABLE_CHARS
+    # The map is keyed by the lowercase character for letters; for
+    # symbols both shifted and unshifted forms are present, but using
+    # the lowercase variant for the lookup keeps the logic uniform.
+    key = c.lower() if c.isalpha() else c
+    usage = GlobalContext.convert_key_to_hid_usage_id(key)
+    if usage is None:
+        return None
+    return (usage, needs_shift)
 
 
 # Populated on first successful pynput load. `None` until then.
@@ -101,6 +226,19 @@ class ToothkeyKeyboardHandler:
     event_handlers = None
 
     active = True
+
+    # Set True for the duration of a clipboard-paste synth so we don't
+    # re-enter _do_clipboard_paste from a nested on_press (X11 key
+    # repeat can re-fire on_press for V while we're mid-paste). Also
+    # consulted by on_press / on_release as a "ignore the user's real
+    # keyboard while we drive the BT peer ourselves" interlock.
+    paste_in_progress = False
+
+    # True between the Ctrl+V chord press and the matching V release.
+    # X11 auto-repeat will re-fire on_press(V) while V stays down, and
+    # without this flag we'd kick off a fresh paste on every repeat.
+    # Cleared in on_release(V).
+    paste_v_consumed = False
 
     @classmethod
     def get_event_handlers(cls):
@@ -203,8 +341,21 @@ class ToothkeyKeyboardHandler:
     @classmethod
     def on_press(cls, key):
         # We intentionally do NOT look at key combinations to toggle
-        # grab mode or shut down — control lives in the tray menu. Every
-        # key we see is passed straight through when grab_mode is on.
+        # grab mode or shut down — control lives in the tray menu.
+        # Every key we see is passed straight through when grab_mode
+        # is on, EXCEPT Ctrl+V which we hijack to paste the user's
+        # desktop clipboard into the BT peer as simulated keystrokes.
+        # See _do_clipboard_paste for the rationale.
+        if cls._maybe_intercept_paste(key):
+            return
+
+        # Drop real key events while we're synthesising a paste so the
+        # user's keystrokes don't interleave with the typed-out
+        # clipboard. The listener stays alive (we'd lose Ctrl release
+        # tracking otherwise), we just don't forward.
+        if cls.paste_in_progress:
+            return
+
         pressed_common_key_count = (
             len(cls.input_key_set) - len(cls.input_modifier_key_set))
         if pressed_common_key_count >= cls.states_input_key_limit:
@@ -221,6 +372,24 @@ class ToothkeyKeyboardHandler:
 
     @classmethod
     def on_release(cls, key):
+        # Clear the V-consumed latch as soon as the user lifts V, so
+        # the NEXT distinct Ctrl+V press triggers a fresh paste rather
+        # than being suppressed as a stale auto-repeat.
+        if cls.paste_v_consumed:
+            name = cls.parse_key_name(key)
+            if name and name.lower() == 'v':
+                cls.paste_v_consumed = False
+                # The V press never reached input_key_set (we consumed
+                # it in _maybe_intercept_paste), so we don't have a
+                # corresponding press report to undo. Drop the release
+                # silently — the boot-keyboard rollover below would
+                # also no-op, but returning early keeps the wire
+                # quiet.
+                return
+
+        if cls.paste_in_progress:
+            return
+
         # Boot Keyboard roll-over semantics are "release any key =>
         # flush the non-modifier slots". That matches what real USB
         # keyboards report when the host's HID driver is polling.
@@ -231,6 +400,131 @@ class ToothkeyKeyboardHandler:
 
         if GlobalContext.grab_mode:
             GlobalContext.send_data_to_device(bytes(cls.states))
+
+    @classmethod
+    def _maybe_intercept_paste(cls, key) -> bool:
+        """If `key` is the V of a Ctrl+V chord and we're in grab mode,
+        kick off a clipboard-to-keystrokes paste and return True.
+        Otherwise return False and let on_press handle the key
+        normally.
+
+        Returns True even when the chord is detected but a paste is
+        already in flight (X11 auto-repeats Ctrl+V while V stays
+        down) — the caller must NOT also forward the key through the
+        normal path in that case.
+        """
+        if not GlobalContext.grab_mode:
+            return False
+        if keyboard is None:
+            # pynput hasn't loaded yet, which means we're not inside a
+            # listener callback — `key` is bogus.
+            return False
+
+        name = cls.parse_key_name(key)
+        if not name or name.lower() != 'v':
+            return False
+
+        ctrl_held = (keyboard.Key.ctrl_l in cls.input_modifier_key_set
+                     or keyboard.Key.ctrl_r in cls.input_modifier_key_set)
+        if not ctrl_held:
+            return False
+
+        if cls.paste_in_progress or cls.paste_v_consumed:
+            # Either we're mid-paste right now, or this is an X11 key
+            # repeat for the V we already consumed. Either way: eat
+            # the event so the chord doesn't slip through to the BT
+            # peer as a stray Ctrl+V.
+            return True
+
+        cls.paste_v_consumed = True
+        cls._do_clipboard_paste()
+        return True
+
+    @classmethod
+    def _do_clipboard_paste(cls):
+        """Type the user's desktop clipboard into the BT peer.
+
+        Runs synchronously on the listener thread so the user's
+        physical keystrokes can't interleave with the synthesised
+        ones (pynput delivers key events one-at-a-time per listener,
+        so blocking here naturally blocks further on_press / on_release
+        until we return). For a 1k-character paste that's ~8 s of
+        unresponsive keyboard, which matches user expectations: while
+        the clipboard is being typed out, you don't want your own
+        keypresses to go to the iPhone too.
+
+        Wire sequence per character:
+            1. press report  : modifier = (Shift if needed else 0),
+                               key[0]   = HID usage id
+            2. release report: modifier = 0, all key slots zeroed
+        With the inter-edge delay (`_PASTE_INTERCHAR_DELAY_S`) iOS
+        sees each char as a discrete keypress.
+
+        Before/after the loop:
+            - Pre-loop: emit a "no modifiers, no keys" report so the
+              Ctrl the user is still physically holding doesn't taint
+              the typed chars on the iPhone side.
+            - Post-loop: rebuild the report from the still-current
+              input_modifier_key_set (Ctrl is most likely still down)
+              so subsequent on_release(Ctrl) sees a coherent state.
+        """
+        cls.paste_in_progress = True
+        try:
+            text = _read_desktop_clipboard()
+            if not text:
+                print('[kbd] Ctrl+V intercept: clipboard is empty / '
+                      'unreadable; nothing to paste')
+                return
+
+            print(f'[kbd] Ctrl+V intercept: pasting {len(text)} char(s) '
+                  f'from desktop clipboard')
+
+            # Step 1: tell the iPhone "no modifiers, no keys" so the
+            # Ctrl the user is still holding doesn't combine with the
+            # first typed char into an unwanted shortcut.
+            quiescent = bytearray(cls.states)
+            quiescent[cls.states_modifier_keys_index] = 0x00
+            for i in range(cls.states_input_key_start_index,
+                           cls.states_size):
+                quiescent[i] = 0x00
+            GlobalContext.send_data_to_device(bytes(quiescent))
+            time.sleep(_PASTE_INTERCHAR_DELAY_S)
+
+            # Step 2: type each char as press + release.
+            skipped = 0
+            for ch in text:
+                mapped = _char_to_hid(ch)
+                if mapped is None:
+                    skipped += 1
+                    continue
+                usage, needs_shift = mapped
+
+                press = bytearray(quiescent)
+                press[cls.states_modifier_keys_index] = (
+                    _HID_MOD_SHIFT_L if needs_shift else 0x00)
+                press[cls.states_input_key_start_index] = usage
+                GlobalContext.send_data_to_device(bytes(press))
+                time.sleep(_PASTE_INTERCHAR_DELAY_S)
+
+                # Release: zero modifier byte AND zero key slots, so
+                # the next iteration's "press" is unambiguously an
+                # edge transition (iOS treats two identical reports
+                # back-to-back as a single keypress).
+                GlobalContext.send_data_to_device(bytes(quiescent))
+                time.sleep(_PASTE_INTERCHAR_DELAY_S)
+
+            if skipped:
+                print(f'[kbd] paste: skipped {skipped} unmappable '
+                      f'char(s) (non-ASCII / control codes)')
+
+            # Step 3: re-assert whatever modifiers the user is still
+            # physically holding. on_release for those modifiers will
+            # then see a coherent BT state and can drive it back to
+            # zero normally.
+            cls.update_states()
+            GlobalContext.send_data_to_device(bytes(cls.states))
+        finally:
+            cls.paste_in_progress = False
 
     @classmethod
     def parse_key_name(cls, key):

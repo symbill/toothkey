@@ -35,11 +35,14 @@ Lifecycle:
     - Qt event loop runs the UI. Exit menu sends {"type":"shutdown"};
       tray reads EOF when the worker exits, then quits itself.
 
-Menu contract (per the original spec):
+Menu contract:
+    - if paused          : "Unpause <name>"  (suppresses everything below)
     - if connected       : "Disconnect <name>"
-    - if not grab-mode   : "Grab keyboard"
-    - if grab-mode       : "Ungrab keyboard"
+                         : "Pause <name>"    (= Disconnect, no auto-reconnect)
+    - if connected, not grab-mode : "Grab keyboard"
+    - if connected, grab-mode     : "Ungrab keyboard"
     - always             : "Open log folder"
+    - always             : "Restart"
     - always             : "Exit" (signals the worker to clean up)
 """
 
@@ -153,6 +156,16 @@ X_INSET_FRAC = 0.15          # how far the X stays from the icon edges
 # well at 16 px against both light and dark panel backgrounds.
 GRAB_TINT_COLOR = QColor('#28b84a')
 
+# Blue pause overlay geometry. Two vertical bars centred on the tooth
+# with a dark outline so they stay legible at 16 px against both light
+# and dark panel backgrounds (same readability requirement as the red
+# X overlay above).
+PAUSE_FILL_COLOR = QColor('#2e8aff')
+PAUSE_OUTLINE_COLOR = QColor('#0a2a5c')
+PAUSE_BAR_WIDTH_FRAC = 0.16   # width of each bar, as fraction of icon edge
+PAUSE_BAR_HEIGHT_FRAC = 0.55  # height of each bar
+PAUSE_BAR_GAP_FRAC = 0.10     # gap between the two bars
+
 
 # ---------------------------------------------------------------------------
 # icon building
@@ -200,6 +213,58 @@ def _paint_red_x(pm: QPixmap) -> QPixmap:
     return out
 
 
+def _paint_pause(pm: QPixmap) -> QPixmap:
+    """Dark-outlined blue pause-bars (||) overlaid on `pm`. Used for
+    the "device paused" tray icon so the user can tell at a glance
+    that the disconnected state is intentional (vs. the red-X
+    "trying to reconnect" state).
+    """
+    out = QPixmap(pm)
+    size = out.width()
+    bar_w = max(2, round(size * PAUSE_BAR_WIDTH_FRAC))
+    bar_h = max(4, round(size * PAUSE_BAR_HEIGHT_FRAC))
+    gap = max(2, round(size * PAUSE_BAR_GAP_FRAC))
+
+    # Two bars centred horizontally with `gap` between them.
+    total_w = bar_w * 2 + gap
+    left_x = (size - total_w) / 2
+    top_y = (size - bar_h) / 2
+    radius = max(1, bar_w / 4)
+
+    painter = QPainter(out)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+
+    # Draw the dark outline pass first (slightly larger), then the
+    # blue fill on top — same two-pass approach as the red X overlay,
+    # so the bars stay legible against both light and dark tooth
+    # fills at small icon sizes.
+    outline_inset = -1.0
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QBrush(PAUSE_OUTLINE_COLOR))
+    for i in range(2):
+        x = left_x + i * (bar_w + gap)
+        rect_path = QPainterPath()
+        rect_path.addRoundedRect(
+            float(x + outline_inset), float(top_y + outline_inset),
+            float(bar_w - 2 * outline_inset), float(bar_h - 2 * outline_inset),
+            float(radius + 1), float(radius + 1),
+        )
+        painter.drawPath(rect_path)
+
+    painter.setBrush(QBrush(PAUSE_FILL_COLOR))
+    for i in range(2):
+        x = left_x + i * (bar_w + gap)
+        rect_path = QPainterPath()
+        rect_path.addRoundedRect(
+            float(x), float(top_y),
+            float(bar_w), float(bar_h),
+            float(radius), float(radius),
+        )
+        painter.drawPath(rect_path)
+    painter.end()
+    return out
+
+
 def _paint_tinted(pm: QPixmap, color: QColor) -> QPixmap:
     """Return a copy of pm with its non-transparent pixels flooded with
     `color`, preserving the original alpha channel. Used for the "grab on"
@@ -235,26 +300,29 @@ def _paint_dimmed(pm: QPixmap, opacity: float = 0.35) -> QPixmap:
 def build_icons() -> tuple:
     """Build the tray icon variants we render:
       - connected     : plain tooth (white/default fill)
-      - disconnected  : tooth + red X
+      - disconnected  : tooth + red X (auto-reconnecting)
+      - paused        : tooth + blue pause bars (user-paused; no auto-reconnect)
       - grabbed       : green-tinted tooth (keyboard-grab is on)
       - shutting_down : faded tooth (Exit in progress)
 
-    Returns (connected, disconnected, grabbed, shutting_down).
+    Returns (connected, disconnected, paused, grabbed, shutting_down).
     """
     renderer = QSvgRenderer(ICON_SVG_PATH)
     if not renderer.isValid():
         raise RuntimeError(f'failed to load SVG icon at {ICON_SVG_PATH}')
     connected = QIcon()
     disconnected = QIcon()
+    paused = QIcon()
     grabbed = QIcon()
     shutting_down = QIcon()
     for size in ICON_SIZES:
         base = _render_svg_pixmap(renderer, size)
         connected.addPixmap(base)
         disconnected.addPixmap(_paint_red_x(base))
+        paused.addPixmap(_paint_pause(base))
         grabbed.addPixmap(_paint_tinted(base, GRAB_TINT_COLOR))
         shutting_down.addPixmap(_paint_dimmed(base))
-    return connected, disconnected, grabbed, shutting_down
+    return connected, disconnected, paused, grabbed, shutting_down
 
 
 # ---------------------------------------------------------------------------
@@ -857,7 +925,7 @@ class Tray(QObject):
         super().__init__()
         self.app = app
 
-        (self.icon_connected, self.icon_disconnected,
+        (self.icon_connected, self.icon_disconnected, self.icon_paused,
          self.icon_grabbed, self.icon_shutting_down) = build_icons()
 
         self.tray = QSystemTrayIcon(self.icon_disconnected, self)
@@ -870,7 +938,8 @@ class Tray(QObject):
         self.tray.show()
 
         # Last-rendered state, used to skip redundant menu rebuilds.
-        self._state = {'connected': False, 'name': None, 'mac': None, 'grab': False}
+        self._state = {'connected': False, 'name': None, 'mac': None,
+                       'grab': False, 'paused': False}
         self._shutting_down = False
         # True between "user clicked Grab" and "worker confirmed grab=True".
         # Drives the pulse animation on the floating indicator.
@@ -901,12 +970,29 @@ class Tray(QObject):
 
     def _rebuild_menu(self):
         self.menu.clear()
-        s = getattr(self, '_state', {'connected': False, 'name': None, 'mac': None, 'grab': False})
+        s = getattr(self, '_state',
+                    {'connected': False, 'name': None, 'mac': None,
+                     'grab': False, 'paused': False})
 
-        if s['connected']:
-            label = s.get('name') or s.get('mac') or 'device'
-            act = self.menu.addAction(f'Disconnect {label}')
-            act.triggered.connect(self._on_disconnect)
+        label = s.get('name') or s.get('mac') or 'device'
+
+        if s.get('paused'):
+            # Paused state: device is intentionally disconnected and
+            # auto-reconnect is suppressed. Only useful action is to
+            # bring it back ("Unpause"). Hide Disconnect / Pause /
+            # Grab — they're either redundant (already disconnected)
+            # or meaningless without a peer to forward keys to.
+            act = self.menu.addAction(f'Unpause {label}')
+            act.triggered.connect(self._on_unpause)
+            self.menu.addSeparator()
+        elif s['connected']:
+            disconnect_act = self.menu.addAction(f'Disconnect {label}')
+            disconnect_act.triggered.connect(self._on_disconnect)
+            # Pause sits right under Disconnect because it's "Disconnect
+            # but for real this time" — same effect now, but no
+            # auto-reconnect until the user explicitly Unpauses.
+            pause_act = self.menu.addAction(f'Pause {label}')
+            pause_act.triggered.connect(self._on_pause)
             self.menu.addSeparator()
 
             # Grab/ungrab is only meaningful while we have a peer to
@@ -932,18 +1018,30 @@ class Tray(QObject):
     def _refresh_ui_from_state(self):
         s = self._state
         connected = bool(s.get('connected'))
+        paused = bool(s.get('paused'))
         name = s.get('name') or s.get('mac')
         grab = bool(s.get('grab'))
 
         # Icon priority:
-        #   - disconnected  -> red-X tooth (state trumps everything)
+        #   - paused        -> blue-pause tooth (intentional disconnect
+        #     by the user; trumps the auto-reconnecting red-X cue
+        #     because "this state is on purpose, not a problem to fix")
+        #   - disconnected  -> red-X tooth (auto-reconnecting)
         #   - connected + grabbed -> green tooth (keystrokes are being
         #     forwarded right now; this is the loudest UI cue we can
         #     give a user who's about to type into a real keyboard)
         #   - connected, not grabbed -> plain white tooth
         # The floating top-right indicator still drives its own visual
         # state independently (see _on_toggle_grab / _on_state_changed).
-        if connected:
+        if paused:
+            self.tray.setIcon(self.icon_paused)
+            label = name or 'device'
+            self.tray.setToolTip(
+                f'Tooth-key\n'
+                f'Paused: {label}\n'
+                f'Right-click for Unpause'
+            )
+        elif connected:
             if grab:
                 self.tray.setIcon(self.icon_grabbed)
             else:
@@ -1039,7 +1137,10 @@ class Tray(QObject):
     def _on_state_changed(self, msg: dict):
         # Filter out the "type" key so _state has the same shape
         # _current_state() in worker.py produces.
-        self._state = {k: msg.get(k) for k in ('connected', 'name', 'mac', 'grab')}
+        self._state = {
+            k: msg.get(k)
+            for k in ('connected', 'name', 'mac', 'grab', 'paused')
+        }
 
         # Reconcile the floating indicator with the authoritative state
         # from the worker. This fires in three distinct flows:
@@ -1071,7 +1172,8 @@ class Tray(QObject):
         # Unexpected: worker died on its own. Flip the icon to a clear
         # "broken" state and notify. We don't auto-respawn — restart
         # by the user via ./start.sh is the intended recovery.
-        self._state = {'connected': False, 'name': None, 'mac': None, 'grab': False}
+        self._state = {'connected': False, 'name': None, 'mac': None,
+                       'grab': False, 'paused': False}
         self._grab_pending = False
         self.indicator.hide_indicator()
         self.tray.setIcon(self.icon_disconnected)
@@ -1093,6 +1195,41 @@ class Tray(QObject):
     def _on_disconnect(self):
         print('[tray] disconnect requested')
         self.link.send({'type': 'disconnect'})
+
+    def _on_pause(self):
+        """Ask the worker to pause the current peer.
+
+        Optimistically flips local state to paused so the menu / icon
+        update on the same Qt tick — the worker's state broadcast
+        will land within ~300 ms and authoritatively confirm.
+        """
+        label = (self._state.get('name') or self._state.get('mac')
+                 or 'device')
+        print(f'[tray] pause requested for {label}')
+        self.link.send({'type': 'pause'})
+        # Drop grab-pending UI: pausing implicitly disconnects the
+        # peer, which the worker reports as grab=False on its state
+        # broadcast — but we want the floating indicator to vanish
+        # immediately rather than waiting for the round-trip.
+        self._grab_pending = False
+        self.indicator.hide_indicator()
+        self._state = dict(
+            self._state, connected=False, paused=True, grab=False)
+        self._refresh_ui_from_state()
+
+    def _on_unpause(self):
+        """Ask the worker to leave the paused state and reconnect to
+        the saved peer. Optimistic UI update mirrors _on_pause.
+        """
+        label = (self._state.get('name') or self._state.get('mac')
+                 or 'device')
+        print(f'[tray] unpause requested for {label}')
+        self.link.send({'type': 'unpause'})
+        # Stay disconnected in the local state until the worker
+        # confirms the reconnect — but clear the paused flag so the
+        # icon flips back to red-X (auto-reconnecting) immediately.
+        self._state = dict(self._state, paused=False)
+        self._refresh_ui_from_state()
 
     def _on_toggle_grab(self):
         new_state = not self._state.get('grab', False)
