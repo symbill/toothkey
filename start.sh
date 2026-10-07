@@ -26,10 +26,21 @@ function install_dependencies() {
     sudo apt install -y \
         bluez bluez-firmware bluez-obexd bluez-tools \
         python3 python3-pip \
-        python3-pynput python3-dbus python3-gi python3-bluez \
-        python3-pyqt5 python3-pyqt5.qtsvg \
+        python3-evdev python3-dbus python3-gi python3-bluez \
+        python3-pyqt5 python3-pyqt5.qtsvg python3-xlib \
         python3-setproctitle \
         xclip wl-clipboard
+    # python3-evdev backs keyboard capture: the worker reads
+    # /dev/input/event* directly and takes a kernel EVIOCGRAB, which
+    # works the same on Wayland, X11 and the console. See
+    # keyboard_evdev.py for why this is not done through the display
+    # server.
+    #
+    # python3-xlib lets the tray set the one window-manager hint Qt has
+    # no API for — _NET_WM_STATE_SKIP_TASKBAR, which is what keeps the
+    # floating tooth and the toast out of the taskbar. See
+    # x11_window_hints.py.
+    #
     # xclip + wl-clipboard back the Ctrl+V "paste desktop clipboard
     # into iPhone via keystrokes" feature in keyboard_handler.py.
     # Both are tiny and we install both so the same binary works on
@@ -172,6 +183,34 @@ function quiet_obex_services() {
     fi
 }
 
+function prepare_worker_bluetooth() {
+    # Run before the systemd worker starts (ExecStartPre). Kills obexd and,
+    # if the adapter still advertises non-HID UUIDs, restarts bluetooth while
+    # the worker is not yet running — avoids suicide via Requires=bluetooth.
+    quiet_obex_services
+    local pollution
+    pollution=$(PYTHONDONTWRITEBYTECODE=1 python3 -c "
+import sys
+sys.path.insert(0, '$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)')
+from bluetooth_handler import check_adapter_pollution
+r = check_adapter_pollution()
+print('; '.join(r))
+" 2>/dev/null || true)
+    if [ -n "$pollution" ]; then
+        echo "  ! adapter polluted: $pollution"
+        echo "  . restarting bluetooth before worker start"
+        if [ "$(id -u)" -eq 0 ]; then
+            systemctl restart bluetooth
+        else
+            sudo systemctl restart bluetooth
+        fi
+        sleep 3
+        quiet_obex_services
+    else
+        echo "  = adapter advertisement looks clean"
+    fi
+}
+
 function init_bluez() {
     echo "Initializing BlueZ..."
     write_toothkey_override "${1:-}"
@@ -272,6 +311,8 @@ usage: $0 [flag]
     --debug-off          disable bluetoothd debug and restart it; exit
     --install-launcher   install Tooth-key into the application menu; exit
     --uninstall-launcher remove the application-menu entry; exit
+    --quiet-obex         stop obexd (legacy; prefer --prepare-worker-bt); exit
+    --prepare-worker-bt  obex cleanup + bluetooth restart if adapter polluted; exit
     -h, --help           show this message and exit
 EOF
 }
@@ -332,6 +373,14 @@ case "$1" in
         ;;
     --uninstall-launcher)
         uninstall_launcher
+        exit 0
+        ;;
+    --quiet-obex)
+        quiet_obex_services
+        exit 0
+        ;;
+    --prepare-worker-bt)
+        prepare_worker_bluetooth
         exit 0
         ;;
     --cli)
@@ -438,11 +487,10 @@ if [ "$before" != "$after" ]; then
     sudo systemctl restart bluetooth
 fi
 
-# pynput + QSystemTrayIcon both need access to the X/Wayland display. As
-# we run python as root (L2CAP raw sockets require CAP_NET_RAW), grant
-# root permission to use the current user's X display. xhost is a no-op
-# on pure Wayland sessions; that's fine \u2014 Qt will fall back to the
-# Wayland socket directly.
+# Grant root access to the user's X display. Keyboard capture doesn't
+# need it (the worker reads /dev/input directly), but the root worker
+# shells out to xclip for the Ctrl+V clipboard read on X11. xhost is a
+# no-op on pure Wayland sessions, which is fine: wl-paste is used there.
 xhost +SI:localuser:root >/dev/null 2>&1 || true
 
 # Re-run install_dependencies if a required Python module is missing.
@@ -454,7 +502,7 @@ xhost +SI:localuser:root >/dev/null 2>&1 || true
 function ensure_python_deps() {
     local missing=()
     local mod
-    for mod in pynput dbus gi bluetooth PyQt5.QtSvg PyQt5.QtWidgets setproctitle; do
+    for mod in evdev dbus gi bluetooth Xlib PyQt5.QtSvg PyQt5.QtWidgets setproctitle; do
         if ! python3 -c "import $mod" >/dev/null 2>&1; then
             missing+=("$mod")
         fi
@@ -550,7 +598,7 @@ if [ "${1:-}" = "--cli" ]; then
 fi
 
 # Tray flow (default): two detached processes — a root-side worker
-# (L2CAP raw sockets, pynput) and a user-side Qt tray — that talk
+# (L2CAP raw sockets, /dev/input capture) and a user-side Qt tray — that talk
 # over a Unix-domain socket. The worker is the server; the tray is
 # the client. Privileged process is the stable one, so a tray
 # restart doesn't cost us a sudo prompt or a BT re-init.
@@ -785,7 +833,7 @@ PY
     fi
 
     # Final hammer. If anything's still alive here it's because it
-    # ignored SIGTERM (pynput listeners stuck in a syscall, an L2CAP
+    # ignored SIGTERM (a reader thread stuck in a syscall, an L2CAP
     # accept() that close() couldn't wake, etc). SIGKILL is not
     # ignorable — this always succeeds.
     local stubborn
@@ -822,7 +870,7 @@ rm -f "$SOCKET_PATH"
 
 echo "Starting BT worker (as root, via sudo -n)..."
 # -E preserves SUDO_UID/SUDO_GID/DISPLAY/XAUTHORITY/XDG_RUNTIME_DIR
-# so (a) the worker can chown the socket back to us and (b) pynput
+# so (a) the worker can chown the socket back to us and (b) xclip
 # can still reach the X server. nohup (not setsid!) is what keeps
 # it alive past shell exit — see the big comment above.
 # python3 -u forces unbuffered stdout/stderr so our logging_setup

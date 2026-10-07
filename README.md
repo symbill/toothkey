@@ -30,6 +30,11 @@ Now keyboard-only, more reliable persisted pairing, and a proper tray UI.
 - **Grab mode** suppresses keys from the host while forwarding them to
   the Bluetooth peer. A floating tooth appears at the top-right of the
   screen so you always know grab is active — click it to ungrab.
+  The grab is a kernel-level `EVIOCGRAB` on the keyboard's
+  `/dev/input` node, so while it is held your keystrokes genuinely do
+  not reach any local application — not the focused window, not the
+  compositor. **Ctrl+Alt+Shift+Esc releases it** from anywhere, which
+  is the escape hatch if the tray or the Bluetooth link ever wedges.
 - **Ctrl+V pastes the Linux clipboard into the iPhone.** While grab
   mode is on, Ctrl+V is intercepted: instead of forwarding the chord
   to iOS (which doesn't bind Ctrl+V to paste anyway — it expects
@@ -41,10 +46,18 @@ Now keyboard-only, more reliable persisted pairing, and a proper tray UI.
 
 ## Requirements
 
-- Linux with BlueZ 5.x (tested on Kubuntu/Ubuntu 24.04)
+- Linux with BlueZ 5.x (tested on Kubuntu/Ubuntu 24.04 and 26.04)
 - A working Bluetooth controller (BR/EDR — classic Bluetooth)
 - Python 3.10+
-- X11 or Wayland session (the tray needs a display)
+- X11 or Wayland session. Keyboard capture is display-server
+  independent (it reads `/dev/input` directly), so grab works the same
+  on both. The tray itself asks Qt for the **xcb** platform even in a
+  Wayland session — see [Why the tray runs on
+  XWayland](#why-the-tray-runs-on-xwayland).
+- `XWayland` present in a Wayland session (it is, by default, on
+  Kubuntu/KDE)
+- `python3-xlib`, for the one window-manager hint Qt can't set (keeping
+  the floating tooth and the toast out of the taskbar)
 - `xclip` and/or `wl-clipboard` on the user's `$PATH` (auto-installed;
   required for the Ctrl+V "paste desktop clipboard into iPhone"
   feature — without them Ctrl+V silently does nothing)
@@ -185,17 +198,29 @@ Bluetooth peer — with one exception:
 | Chord (while grabbed) | What Tooth-key does |
 |------------------------|----------------------|
 | `Ctrl+V`              | **Special case.** Reads your Linux desktop clipboard (`xclip` on X11, `wl-paste` on Wayland) and types its contents into the iPhone as simulated keystrokes. The Ctrl+V chord itself is _not_ forwarded — iOS doesn't bind Ctrl+V to paste anyway (Cmd+V is the iOS hardware-keyboard chord), so the only practical effect is "the text I just copied on Linux now appears in the iOS text field". Non-typeable characters (most non-ASCII / control codes) are skipped. |
+| `Ctrl+Alt+Shift+Esc`  | **Panic release.** Drops the keyboard grab immediately. Handled inside the capture loop itself, so it works even if the tray has died or the Bluetooth link is wedged — the one way out that depends on nothing else. Not forwarded to the peer. |
 
 Everything else — including `Ctrl+C`, `Cmd+V`, `Ctrl+Shift+V`,
 function keys, etc. — is forwarded as-is. If you want to send a
 literal Ctrl+V to the iPhone for some reason, ungrab first, focus
 the target app on iOS, then re-grab.
 
+Because capture reads *physical* keycodes rather than characters your
+layout has already produced, your Linux keyboard layout does not
+matter: the iPhone applies its own, exactly as it would for a real USB
+keyboard.
+
 ## Log files
 
 All logs live in the `logs/` subdirectory of the repo. They are
-appended to across runs (not rotated) — delete them manually if they
-get large, or run `./debug.sh` which truncates them before capture.
+appended to across runs and rotated by size: each file is rolled to
+`<name>.1`, `<name>.2`, ... once it passes 16 MB, keeping 3
+generations of `toothkey.log` and 2 of the diag files. `./debug.sh`
+truncates them before capture.
+
+Rotation matters here because these files are in the repo, not
+`/var/log`, so nothing else caps them — and a BlueZ adapter that is
+scanning generates events for every device in radio range.
 
 | File                       | Written by | Purpose |
 |---------------------------|------------|---------|
@@ -251,17 +276,43 @@ In installed (systemd) mode, the worker's output is also captured in
     on the iPhone.
 
 - **Grab doesn't capture my keys**
-  - On X11, `pynput`'s key capture needs access to the display. The
-    tray runs `xhost +SI:localuser:root` at startup so the (root)
-    worker can open the display. Verify with `xhost` that the
-    `localuser:root` entry is present.
-  - On pure Wayland sessions some keys may not be capturable; fall
-    back to an X11 session.
+  - Capture needs root, because `/dev/input/event*` is `root:input`
+    mode 0660. In installed mode the worker runs as root already; if
+    you launched by hand, check that the worker is not running as your
+    user.
+  - The worker logs exactly which devices it would capture, every
+    start. Look for `[kbd] probe:` in `logs/toothkey.log` — one line
+    per input device, with `WILL GRAB` on the ones it picked and a
+    reason on the ones it skipped. If nothing says `WILL GRAB`, that
+    is the problem, and the reasons say why.
+  - Prove it independently of Bluetooth:
 
-- **"Worker unreachable: … No such file or directory" (installed mode)**
-  - The worker service isn't running. Check
+    ```bash
+    sudo python3 tools/kbd_selftest.py --grab
+    ```
+
+    This takes the same exclusive grab and prints the HID report for
+    every key you press. If keys show up there, capture works and
+    anything still wrong is on the Bluetooth side.
+  - `EBUSY` on a device means another process already holds an
+    exclusive grab on it. The log names the device.
+  - The grab is released when the Bluetooth link drops, when the tray
+    disconnects, on `Ctrl+Alt+Shift+Esc`, and whenever the worker
+    exits for any reason — the kernel drops a grab when the file
+    descriptor closes, so a crash cannot leave your keyboard captured.
+
+- **Tray says "waiting for the worker" / "reconnecting to the worker"**
+  - That is the tray dialling the worker in the background; it retries
+    forever, backing off to once every 5 s, and recovers on its own as
+    soon as the worker is there. You do not need to restart anything.
+  - If it never clears, the worker really isn't running:
     `systemctl status toothkey-worker` and
     `journalctl -u toothkey-worker -n 50` for the failure reason.
+  - Restarting the **tray** alone is always safe. The worker keeps its
+    listening socket open for its whole life and accepts whatever tray
+    turns up, so the Bluetooth link survives a tray restart, a
+    logout/login, or the tray crashing — and the tray re-syncs its
+    state on connect.
 
 - **Ctrl+V doesn't paste anything into the iPhone**
   - Check `logs/toothkey.log` for a `[kbd] clipboard read failed: …`
@@ -303,3 +354,78 @@ In installed (systemd) mode, the worker's output is also captured in
 - **Cleanly disconnects** via `Device1.Disconnect()` on shutdown so
   subsequent launches reconnect without waiting for iOS's 40-second
   supervision timeout.
+- **Captures the keyboard through evdev**, not the display server:
+  the root worker opens the keyboard's `/dev/input/event*` node and
+  takes an exclusive `EVIOCGRAB`. Linux keycodes map straight onto HID
+  usage IDs, which is exactly what a boot-protocol report carries, so
+  there is no layout round-trip. See `keyboard_evdev.py` for the full
+  rationale.
+- **Ignores every peer that isn't a classic HID host.** A scanning
+  adapter reports every LE advertiser in range; those use rotating
+  random addresses and can't host a classic HID session, so they are
+  neither paired with nor logged at full volume. Pairing attempts are
+  also rate-limited per peer.
+
+### Why the tray runs on XWayland
+
+The tray asks Qt for the `xcb` platform even inside a Wayland session.
+The floating grab indicator has three requirements that Wayland's
+xdg-shell deliberately does not give a client: placing its own window
+at a chosen position, keeping it above other windows, and keeping it
+out of the taskbar. Under Wayland, `move()` is silently ignored, a
+parentless `Qt.Tool` becomes an ordinary toplevel (so it gets a
+taskbar button), and there is no protocol for "keep above" — so the
+indicator ends up wherever the compositor feels like putting it,
+listed in the taskbar, and dropping behind whatever you click next.
+
+Under xcb, Qt maps it as `_NET_WM_WINDOW_TYPE_UTILITY` with
+`_NET_WM_STATE_ABOVE`, and KWin honours the position. Nothing else in
+the tray needs Wayland — the tray icon is the StatusNotifierItem D-Bus
+protocol, which is display-server agnostic — and keyboard capture
+never touches the display server at all.
+
+Keeping those two windows out of the taskbar takes one more step, and
+it is not the window type. On KWin 6, `skipTaskbar` is false for both
+`_NET_WM_WINDOW_TYPE_UTILITY` and `_NET_WM_WINDOW_TYPE_NOTIFICATION`,
+so a utility window and a notification window each get a taskbar
+button. Qt has no API for the state that actually decides it, so
+`x11_window_hints.py` sets `_NET_WM_STATE_SKIP_TASKBAR`,
+`_NET_WM_STATE_SKIP_PAGER` and `_KDE_NET_WM_STATE_SKIP_SWITCHER`
+directly, keeping the windows out of the taskbar, the pager and
+Alt+Tab.
+
+Making them override-redirect instead (`Qt.ToolTip`, or
+`Qt.X11BypassWindowManagerHint`) would also hide them from the
+taskbar, by taking them out of the window manager's hands entirely.
+That is the wrong trade: with the bypass hint KWin stops delivering
+mouse input, which breaks clicking the tooth to ungrab. Both windows
+stay managed.
+
+Override with `TOOTHKEY_QT_PLATFORM=wayland` if you want the native
+platform anyway; the tray logs which one it got, and warns when
+placement won't work.
+
+## Tests
+
+```bash
+python3 tests/run_all.py                # everything (127 tests)
+```
+
+| Suite                       | Covers |
+|-----------------------------|--------|
+| `test_keyboard_evdev.py`    | HID report assembly, modifier bitmask, 6-key rollover, chord handling, which input devices qualify, and that the keycode table is a true inverse of the kernel's. |
+| `test_grab_lifecycle.py`    | That every exit path releases the grab — including a crashing reader — that an all-keys-up report goes out, and that a lost grab is never reported as held. |
+| `test_grab_policy.py`       | That a grab which could not be taken is reported as *off*, that the grab stays armed across a Bluetooth drop without being held, and that a panic release reaches the tray. |
+| `test_pairing_scope.py`     | Which peers get a `Pair()` call, per-peer rate limiting, and log throttling. |
+| `test_x11_hints.py`         | That the taskbar-hint helper refuses bad input and degrades quietly when python-xlib or the X server is missing, rather than breaking the toast path. |
+| `test_tray_link.py`         | That the worker keeps accepting trays — serving a second one after the first disconnects, never closing its listening socket, and pushing state to a reconnecting tray. |
+| `test_hid_reconnect.py`     | The peripheral-initiated HID retry: that a near-miss is retried, that the attempt cap and time budget hold, and that it stops when the ACL goes or a session is adopted. |
+
+None of them needs root, Bluetooth, or a display. The one thing they
+can't cover is `EVIOCGRAB` against real hardware — `tools/kbd_selftest.py`
+does that:
+
+```bash
+sudo python3 tools/kbd_selftest.py           # probe devices only
+sudo python3 tools/kbd_selftest.py --grab    # grab 10s, decode keystrokes
+```

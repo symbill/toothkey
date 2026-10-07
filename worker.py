@@ -60,6 +60,36 @@ try:
     os.makedirs(os.path.dirname(_WORKER_DIAG_PATH), mode=0o775, exist_ok=True)
 except Exception:
     pass
+
+# Size cap for this file. It is append-only across every run and
+# nothing else rotates it, so without a cap it grows for as long as the
+# service keeps restarting — in practice to hundreds of megabytes.
+# Deliberately implemented inline rather than reusing
+# logging_setup.rotate_if_large: this whole block exists to diagnose
+# failures in the imports below it, so it must not depend on them.
+_DIAG_MAX_BYTES = 16 * 1024 * 1024
+_DIAG_KEEP = 2
+_wdiag_written = 0
+
+
+def _diag_rotate(path):
+    """Roll `path` to .1/.2 if it has grown past the cap. Never raises."""
+    try:
+        if os.path.getsize(path) < _DIAG_MAX_BYTES:
+            return False
+        oldest = f'{path}.{_DIAG_KEEP}'
+        if os.path.exists(oldest):
+            os.unlink(oldest)
+        for n in range(_DIAG_KEEP - 1, 0, -1):
+            src = f'{path}.{n}'
+            if os.path.exists(src):
+                os.replace(src, f'{path}.{n + 1}')
+        os.replace(path, f'{path}.1')
+        return True
+    except Exception:
+        return False
+
+_diag_rotate(_WORKER_DIAG_PATH)
 try:
     _worker_diag = open(_WORKER_DIAG_PATH, 'ab', buffering=0)
 except Exception:
@@ -68,12 +98,23 @@ except Exception:
 def _wdiag(msg: str) -> None:
     """Write one timestamped line to worker-diag.log. Unbuffered, bypasses
     logging_setup. Must not raise."""
+    global _worker_diag, _wdiag_written
     if _worker_diag is None:
         return
     try:
         from datetime import datetime as _dt
         ts = _dt.now().astimezone().isoformat(timespec='milliseconds')
-        _worker_diag.write(f'{ts} [worker-diag pid={os.getpid()}] {msg}\n'.encode('utf-8', 'replace'))
+        line = f'{ts} [worker-diag pid={os.getpid()}] {msg}\n'.encode('utf-8', 'replace')
+        _worker_diag.write(line)
+        _wdiag_written += len(line)
+        if _wdiag_written >= 1024 * 1024:
+            _wdiag_written = 0
+            # We hold the file open, so a rename would leave this handle
+            # writing to the rotated-away inode. Reopen onto the new file.
+            if _diag_rotate(_WORKER_DIAG_PATH):
+                try: _worker_diag.close()
+                except Exception: pass
+                _worker_diag = open(_WORKER_DIAG_PATH, 'ab', buffering=0)
     except Exception:
         pass
 
@@ -87,6 +128,7 @@ import logging_setup
 logging_setup.install()
 _wdiag('logging_setup.install() ok')
 
+import keyboard_evdev
 from bluetooth_handler import ToothkeyHandler
 from common import GlobalContext
 from keyboard_handler import ToothkeyKeyboardHandler
@@ -187,10 +229,12 @@ def _command_reader(rfh):
                 continue
             t = msg.get('type')
             if t == 'client_hello':
-                # Tray handshake: forwards its graphical-session env vars
-                # (DISPLAY, WAYLAND_DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR)
-                # so when we later lazy-import pynput for keyboard grab,
-                # pynput can reach the user's X/Wayland compositor.
+                # Tray handshake: forwards its graphical-session env
+                # vars (DISPLAY, WAYLAND_DISPLAY, XAUTHORITY,
+                # XDG_RUNTIME_DIR) so this root process can reach the
+                # user's clipboard via xclip / wl-paste for Ctrl+V.
+                # Keyboard capture needs none of them — it reads
+                # /dev/input directly.
                 env = msg.get('env') or {}
                 applied = []
                 for k in ('DISPLAY', 'WAYLAND_DISPLAY',
@@ -213,7 +257,14 @@ def _command_reader(rfh):
             elif t == 'set_grab':
                 on = bool(msg.get('on'))
                 print(f'[worker] command: set_grab({on})')
-                ToothkeyKeyboardHandler.set_grab_mode(on)
+                reached = ToothkeyKeyboardHandler.set_grab_mode(on)
+                if reached != on:
+                    print(f'[worker] set_grab({on}) could not be honoured; '
+                          f'grab is {reached}')
+                # The state poller picks the new value up either way,
+                # but say so immediately: a refused grab should flip
+                # the tray back without waiting for the next poll.
+                _send({'type': 'state', **_current_state()})
             elif t == 'shutdown':
                 print('[worker] command: shutdown')
                 _send({'type': 'shutdown_ack'})
@@ -229,8 +280,8 @@ def _command_reader(rfh):
                 # which ignores RestartPreventExitStatus.)
                 global _user_initiated_shutdown
                 _user_initiated_shutdown = True
-                # Kick both subsystems so wait_for_client / pynput
-                # listener unblock and the BT main loop drops out.
+                # Kick both subsystems so wait_for_client and the
+                # keyboard reader unblock and the BT main loop drops out.
                 ToothkeyKeyboardHandler.shutdown()
                 ToothkeyHandler.stop()
 
@@ -258,21 +309,99 @@ def _command_reader(rfh):
     except Exception as e:
         print(f'[worker] command reader crashed: {type(e).__name__}: {e}')
         traceback.print_exc()
+    finally:
+        # The tray is the only thing that can ask for a grab, and the
+        # only UI that shows one is held. Once its socket is gone an
+        # exclusive keyboard grab would be invisible and unreleasable
+        # from the desktop, so drop it here no matter how we left the
+        # loop.
+        if GlobalContext.grab_mode or ToothkeyKeyboardHandler.is_running():
+            print('[worker] tray link closed while grabbed; releasing '
+                  'keyboard')
+            ToothkeyKeyboardHandler.set_grab_mode(False)
+
+
+def _serve_tray(conn) -> None:
+    """Serve one tray over `conn`, returning when it goes away.
+
+    Sets up the NDJSON streams, says hello, pushes the current state so
+    a freshly connected tray renders correctly without waiting for
+    something to change, then blocks in _command_reader until EOF or a
+    shutdown command. Always tears the streams down on the way out, so
+    the next tray starts from a clean slate.
+    """
+    global _out_fh
+    conn.settimeout(None)
+    print('[worker] tray connected')
+
+    # One file object per direction so the poller (writer) and command
+    # reader don't contend on internal buffer state.
+    rfh = conn.makefile('r', encoding='utf-8')
+    _out_fh = conn.makefile('w', encoding='utf-8')
+    wfh = _out_fh
+
+    try:
+        _send({'type': 'hello', 'pid': os.getpid()})
+        # The state poller only emits on change, and the link state it
+        # last saw may be minutes old — without this a tray that
+        # reconnects to a long-running worker would sit on its startup
+        # "disconnected" icon until the iPhone next did something.
+        _send({'type': 'state', **_current_state()})
+        _command_reader(rfh)
+    finally:
+        _out_fh = None
+        for fh in (rfh, wfh):
+            try:
+                fh.close()
+            except OSError:
+                pass
+        try:
+            conn.close()
+        except OSError:
+            pass
+        print('[worker] tray link closed')
+
+
+def _tray_link_loop(server, first_conn) -> None:
+    """Accept and serve trays, one at a time, for the life of the worker.
+
+    `first_conn` is the connection main() already accepted, so the
+    first tray isn't made to wait for this thread to start.
+    """
+    conn = first_conn
+    while not _shutdown.is_set():
+        _serve_tray(conn)
+        if _shutdown.is_set():
+            break
+        conn = None
+        # A timeout rather than a blocking accept, so a shutdown that
+        # arrives while no tray is connected still ends this thread.
+        server.settimeout(1.0)
+        while conn is None and not _shutdown.is_set():
+            try:
+                conn, _ = server.accept()
+            except socket.timeout:
+                continue
+            except OSError as e:
+                # The listening socket went away (shutdown closed it).
+                _wdiag(f'tray-link: accept failed: {e}')
+                return
+        if conn is None:
+            return
+        _wdiag('tray-link: accepted a new tray')
+    _wdiag('tray-link: exiting')
 
 
 def _run_connection_session():
     """Block until the current BT client disconnects.
 
-    We deliberately do NOT drive the pynput listener from here. Earlier
-    versions of this function called ToothkeyKeyboardHandler.start()
-    in a loop and relied on listener.stop() to unblock it on
-    disconnect — which falls apart on X11, because pynput's
-    XNextEvent can sit unblocked for many minutes with no pending
-    events. A user walking away from the keyboard would strand us
-    here past the iPhone's reconnect window and the iPhone would
-    show "connected" while the tray was still "disconnected".
+    Capture is deliberately not driven from here. This function must
+    return promptly when the peer goes away, so it only ever waits on
+    the disconnect event; blocking on a keyboard read would strand us
+    past the iPhone's reconnect window, leaving the phone showing
+    "connected" while the tray still showed "disconnected".
 
-    The listener lifecycle is now owned by the keyboard handler
+    The capture lifecycle belongs to the keyboard handler
     itself (see set_grab_mode): it's only alive while grab_mode is
     on, runs in its own daemon thread, and doesn't block our BT
     state machine.
@@ -280,18 +409,16 @@ def _run_connection_session():
     # Auto-resume grab if it was on from a previous session — matches
     # the behaviour of a real BT keyboard that just happens to be in
     # the same "grabbing input" state across reconnects.
-    if (GlobalContext.grab_mode
-            and not (ToothkeyKeyboardHandler.listener is not None
-                     and ToothkeyKeyboardHandler.listener.is_alive())):
+    if GlobalContext.grab_mode and not ToothkeyKeyboardHandler.is_running():
         ToothkeyKeyboardHandler.start_listener()
 
     ToothkeyHandler.wait_until_disconnected()
 
-    # Tear the listener down on our way out so it doesn't leak across
-    # sessions (also so that a reconnect picks up a clean suppress
-    # flag). The stop() call may take a moment to propagate on X11,
-    # but that's fine — the listener is a daemon thread and we're
-    # not waiting for it.
+    # Drop the grab on our way out: with no peer there is nowhere to
+    # forward keystrokes, and holding the user's keyboard exclusively
+    # while disconnected would be indistinguishable from a hang.
+    # grab_mode survives, so the grab is re-taken when the peer
+    # returns (see start_listener).
     ToothkeyKeyboardHandler.stop_listener()
 
 
@@ -398,6 +525,15 @@ def main():
     print(f'[worker] start pid={os.getpid()} euid={os.geteuid()} '
           f'socket={args.socket}')
 
+    # Report up front which keyboard we would capture. Read-only; it
+    # takes no grab. Doing this at startup means the log already
+    # answers "could it have captured anything?" by the time anyone
+    # reports that typing didn't reach the phone.
+    try:
+        keyboard_evdev.describe_input_devices()
+    except Exception as e:
+        print(f'[worker] keyboard probe failed: {type(e).__name__}: {e}')
+
     try:
         server = _setup_server_socket(args.socket)
     except OSError as e:
@@ -438,37 +574,42 @@ def main():
         try: os.unlink(args.socket)
         except OSError: pass
         return 3
-    finally:
-        # Only one tray per worker — stop accepting further connects.
-        # When the tray disconnects the worker exits and systemd
-        # (installed mode) or the user (start.sh mode) re-spawns it.
-        server.close()
-    conn.settimeout(None)
-    print('[worker] tray connected')
 
-    # One file object per direction so the poller (writer) and
-    # command reader don't contend on internal buffer state.
-    rfh = conn.makefile('r', encoding='utf-8')
-    global _out_fh
-    _out_fh = conn.makefile('w', encoding='utf-8')
-
-    _send({'type': 'hello', 'pid': os.getpid()})
+    # A grab can end without the tray asking: the panic chord, or the
+    # last grabbed keyboard being unplugged. Push the new state the
+    # moment that happens so the tray icon never shows a grab that
+    # isn't held.
+    def _on_grab_lost(_state):
+        _send({'type': 'state', **_current_state()})
+    ToothkeyKeyboardHandler.on_grab_lost = staticmethod(_on_grab_lost)
 
     _wdiag('main: starting state-poller thread')
     threading.Thread(target=_state_poller, daemon=True,
                      name='state-poller').start()
-    _wdiag('main: starting cmd-reader thread')
-    threading.Thread(target=_command_reader, args=(rfh,), daemon=True,
-                     name='cmd-reader').start()
+
+    # The listening socket stays open for the life of the worker, and
+    # one thread accepts trays from it in series.
+    #
+    # The worker outlives any individual tray: it owns the Bluetooth
+    # link, which should survive the tray being restarted, the user
+    # logging out and back in, or the tray crashing. If the listening
+    # socket were closed after the first accept, the next tray could
+    # never connect — the worker would keep the iPhone happily paired
+    # while every tray reported "Worker unreachable" until someone
+    # restarted the worker by hand.
+    _wdiag('main: starting tray-link thread')
+    threading.Thread(target=_tray_link_loop, args=(server, conn),
+                     daemon=True, name='tray-link').start()
 
     _wdiag('main: calling _bt_main()')
     _bt_main()
     _wdiag('main: _bt_main() returned')
 
     _shutdown.set()
-    try: conn.shutdown(socket.SHUT_RDWR)
-    except OSError: pass
-    try: conn.close()
+    # Closing the listening socket also unblocks the tray-link thread
+    # if it is parked in accept(); _serve_tray owns closing whichever
+    # tray connection it is holding.
+    try: server.close()
     except OSError: pass
     try: os.unlink(args.socket)
     except OSError: pass

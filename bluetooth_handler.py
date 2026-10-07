@@ -1,4 +1,4 @@
-import os, select, struct, subprocess, threading, time
+import os, queue, select, struct, subprocess, threading, time
 
 import dbus
 
@@ -23,7 +23,10 @@ BT_SECURITY_HIGH = 3
 from dbus import SystemBus, Interface
 from dbus.mainloop.glib import DBusGMainLoop
 from gi.repository import GLib
-from bluetooth_profile import ToothkeyProfile, ToothkeyAgent
+from bluetooth_profile import (
+    ToothkeyProfile, ToothkeyAgent,
+    register_hid_profile_with_bluez, unregister_hid_profile_with_bluez,
+)
 
 # Bluetooth "Class of Device" for a Peripheral Keyboard.
 # Major Device Class = Peripheral (0x05), Minor Device Class = Keyboard.
@@ -31,6 +34,7 @@ from bluetooth_profile import ToothkeyProfile, ToothkeyAgent
 # sees us as a Computer, does a brief SDP probe, and bails before pairing.
 CLASS_OF_DEVICE_PERIPHERAL_KEYBOARD = '0x002540'
 
+DBUS_OBJECT_MAPPER_INTERFACE = 'org.freedesktop.DBus.ObjectManager'
 DBUS_OBJECT_MAPPER_INTERFACE = 'org.freedesktop.DBus.ObjectManager'
 DBUS_PROPERTIES_INTERFACE = 'org.freedesktop.DBus.Properties'
 
@@ -41,6 +45,10 @@ CONTROL_CHANNEL = 0x0011
 INTERRUPT_CHANNEL = 0x0013
 
 CLIENT_MAC_ADDRESS_CACHE = 'client_mac_address.cache'
+
+# Sentinel placed on the per-session HID send queue to ask the sender
+# thread to exit. Not a string/bytes — must be unique.
+_HID_SEND_STOP = object()
 
 
 def _tlog(msg: str) -> None:
@@ -67,6 +75,79 @@ def _tlog(msg: str) -> None:
     except Exception:
         pass
     print(msg, flush=True)
+
+
+# Peripheral-initiated HID open (see _try_open_hid_outbound).
+#
+# The connect timeout is per channel. It used to be 10s, which is a long
+# time to spend discovering that iOS isn't ready: the ACL is already up
+# by this point, so a peer that is going to accept does so in well under
+# a second (measured: 0.1-0.3s). A timeout only ever means "not right
+# now", and the sooner we learn that the sooner we can retry.
+# A peer that is ready answers in 0.1-0.3s, so 3s is already generous;
+# anything longer is just slower to reach the retry.
+_HID_OUTBOUND_CONNECT_TIMEOUT_S = 3.0
+# Attempts per page. iOS often takes the control channel immediately and
+# refuses the interrupt channel for a few seconds after a reconnect, so
+# the usual near-miss resolves on attempt two about four seconds in.
+# Three attempts at this timeout bound the whole sequence to the same
+# ~20s the single 10s-per-channel attempt used to cost, with three
+# chances inside it instead of one. The caller holds the ACL open for
+# 30s, so this fits in that window.
+_HID_OUTBOUND_ATTEMPTS = 3
+_HID_OUTBOUND_RETRY_GAP_S = 1.0
+
+# Device1 properties that change because the radio environment did,
+# not because anything happened to a link we care about. A scanning
+# adapter republishes these for every device in range several times a
+# second.
+_NOISY_DEVICE_PROPS = frozenset((
+    'RSSI', 'TxPower', 'ManufacturerData', 'ServiceData',
+    'AdvertisingFlags', 'AdvertisingData', 'UUIDs',
+))
+
+# Per-key state for _tlog_throttled: key -> (last_emit_monotonic,
+# suppressed_count). Bounded by _THROTTLE_MAX_KEYS so a stream of
+# rotating LE addresses can't grow it without limit.
+_throttle_state:dict = {}
+_THROTTLE_INTERVAL_S = 300.0
+_THROTTLE_MAX_KEYS = 512
+
+
+def _tlog_throttled(key: str, msg: str,
+                    interval_s: float = _THROTTLE_INTERVAL_S) -> None:
+    """Log msg, but at most once per interval_s for a given key.
+
+    For events driven by the radio environment rather than by anything
+    this program does: every LE advertiser in range appearing and
+    disappearing, a peer that is simply not here paging repeatedly.
+    Those are worth a line, and worthless repeated thousands of times —
+    unthrottled they produce hundreds of megabytes a week and bury the
+    events that matter.
+
+    When a key goes quiet again the next emission reports how many
+    repeats were dropped, so the log never implies something happened
+    once when it happened constantly.
+    """
+    now = time.monotonic()
+    last, suppressed = _throttle_state.get(key, (0.0, 0))
+    if last and (now - last) < interval_s:
+        _throttle_state[key] = (last, suppressed + 1)
+        return
+    if len(_throttle_state) >= _THROTTLE_MAX_KEYS and key not in _throttle_state:
+        # Drop the oldest entry rather than grow without bound. Losing
+        # throttle state only risks one extra line being emitted.
+        try:
+            oldest = min(_throttle_state, key=lambda k: _throttle_state[k][0])
+            del _throttle_state[oldest]
+        except ValueError:
+            pass
+    _throttle_state[key] = (now, 0)
+    if suppressed:
+        _tlog(f'{msg} [+{suppressed} more in the last '
+              f'{interval_s:.0f}s]')
+    else:
+        _tlog(msg)
 
 
 def build_device_name() -> str:
@@ -96,8 +177,10 @@ _UUID_TAGS = {
     '0x111e': 'Handsfree',             # -> Audio + Telephony
     '0x111f': 'HandsfreeAudioGateway', # -> Audio + Telephony
     '0x1124': 'HID',                   # <- the only one we actually want
+    '0x112f': 'PhonebookAccessServer',
     '0x1130': 'PhonebookAccessPSE',    # -> Object Transfer
     '0x1132': 'MessageAccessServer',   # -> Object Transfer
+    '0x1133': 'MessageNotificationServer',
     '0x1200': 'PnPInformation',
     '0x1800': 'GenericAccess',
     '0x1801': 'GenericAttribute',
@@ -141,6 +224,218 @@ def _decode_service_class_bits(bits: int) -> str:
     ]
     set_names = [n for mask, n in names if bits & mask]
     return ', '.join(set_names) if set_names else '<none>'
+
+
+# 16-bit SDP UUIDs that must not appear on our adapter advertisement.
+# Presence means obexd or a blocked bluez plugin has polluted SDP/CoD.
+_FORBIDDEN_ADAPTER_UUID_SHORTS = frozenset({
+    '0x1105', '0x1106',  # OBEX
+    '0x1108', '0x110a', '0x110b', '0x110c', '0x110e', '0x110f',  # audio/avrcp
+    '0x1112', '0x111e', '0x111f',  # telephony / handsfree
+    '0x1130', '0x1132', '0x1133',  # phonebook / message access
+    '0x112f',  # phonebook access server
+})
+
+# LimitedDiscoverable (0x001) is benign when the adapter is discoverable.
+_COD_SERVICE_BITS_BENIGN = 0x001
+
+# Which process puts each forbidden UUID on the adapter. Knowing the
+# owner is what makes the difference between a fixable problem and one
+# to leave alone: obexd we stop (transiently — see quiet_obex_daemons),
+# whereas the audio and telephony UUIDs are registered over D-Bus by
+# PipeWire/WirePlumber, which bluetoothd's own `-P` plugin blocklist
+# cannot prevent and which we must not disable — that is the user's
+# Bluetooth audio.
+_UUID_OWNERS = {
+    '0x1105': 'obexd', '0x1106': 'obexd',
+    '0x1130': 'obexd', '0x1132': 'obexd', '0x1133': 'obexd',
+    '0x112f': 'obexd',
+    '0x1108': 'PipeWire', '0x110a': 'PipeWire', '0x110b': 'PipeWire',
+    '0x110c': 'PipeWire', '0x110e': 'PipeWire', '0x110f': 'PipeWire',
+    '0x1112': 'PipeWire', '0x111e': 'PipeWire', '0x111f': 'PipeWire',
+}
+
+
+def _attribute_pollution(reasons:list[str]) -> str:
+    """Summarise who is responsible for the UUIDs in `reasons`.
+
+    Returns a short sentence naming the owners, or '' if none of the
+    reasons mention a UUID we can attribute.
+    """
+    owners = set()
+    blob = ' '.join(reasons)
+    for short, owner in _UUID_OWNERS.items():
+        if short in blob:
+            owners.add(owner)
+    if not owners:
+        return ''
+    if owners == {'obexd'}:
+        return ('owner: obexd, which D-Bus activation restarts on demand; '
+                'stopping it is best-effort')
+    if 'PipeWire' in owners:
+        rest = ' and '.join(sorted(owners - {'PipeWire'}))
+        who = f'PipeWire{" and " + rest if rest else ""}'
+        return (f'owner: {who}. PipeWire registers these over D-Bus, so '
+                f"bluetoothd's -P blocklist cannot stop it and disabling "
+                f'it would take out Bluetooth audio')
+    return 'owner: ' + ', '.join(sorted(owners))
+
+
+def _uuid_to_short(uuid) -> str:
+    """Return '0xNNNN' for a 128-bit BT base UUID, else ''."""
+    try:
+        s = str(uuid).lower()
+        if len(s) == 36 and s.endswith('-0000-1000-8000-00805f9b34fb'):
+            return '0x' + s[4:8]
+    except Exception:
+        pass
+    return ''
+
+
+# Set once quiet_obex_daemons() has run. prepare_adapter and the
+# pollution-remediation paths each want obexd gone, but calling this
+# repeatedly inside one startup is counterproductive: obexd is D-Bus
+# activated, so every stop is followed by a fresh start that
+# re-registers the very OBEX UUIDs we are trying to clear.
+_obex_quieted_this_run = False
+
+
+def _owner_uid() -> int | None:
+    """UID of the desktop user whose session owns obex.service.
+
+    Taken from TOOTHKEY_SOCKET_OWNER, which install.sh bakes into the
+    worker unit. Needed because obex.service is a *user* unit: a root
+    `systemctl stop obex` talks to the system manager, where no such
+    unit exists, and so always fails.
+    """
+    spec = os.environ.get('TOOTHKEY_SOCKET_OWNER', '')
+    uid = spec.split(':', 1)[0].strip()
+    return int(uid) if uid.isdigit() else None
+
+
+def quiet_obex_daemons(force: bool = False) -> bool:
+    """Stop obexd so it cannot pollute adapter SDP/CoD with OBEX UUIDs.
+
+    obexd registers OPP / FTP / PBAP / MAP over SDP, and each of those
+    sets the Object-Transfer bit in the adapter's Class of Device.
+
+    Mirrors start.sh's quiet_obex_services(), including its policy: we
+    stop running instances only, and deliberately do NOT disable or
+    mask the unit, because that is system-wide and would break "Send
+    file via Bluetooth" in every user session.
+
+    obexd is D-Bus activated, so it will come back the next time
+    anything touches org.bluez.obex. This is best-effort by design: the
+    adapter's UUID list, not obexd's absence, is what actually matters,
+    and whether iOS binds the HID session is what matters more.
+
+    Runs at most once per worker start unless `force` is set. Returns
+    True if anything was stopped.
+    """
+    global _obex_quieted_this_run
+    if _obex_quieted_this_run and not force:
+        return False
+    _obex_quieted_this_run = True
+
+    stopped = False
+    uid = _owner_uid()
+
+    for svc in ('obex', 'bluez-obexd'):
+        # The user manager first: that is where BlueZ ships obex.service
+        # and where D-Bus activation starts it.
+        if uid is not None:
+            try:
+                r = subprocess.run(
+                    ['systemd-run', '--quiet', '--pipe', '--wait',
+                     f'--machine={uid}@.host', '--user', '--',
+                     'systemctl', '--user', 'stop', svc],
+                    timeout=10, capture_output=True, text=True,
+                )
+                if r.returncode == 0:
+                    print(f'[adapter] stopped user service: {svc}')
+                    stopped = True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+        try:
+            r = subprocess.run(
+                ['systemctl', 'stop', svc],
+                timeout=10, capture_output=True, text=True,
+            )
+            if r.returncode == 0:
+                print(f'[adapter] stopped system service: {svc}')
+                stopped = True
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+    try:
+        r = subprocess.run(
+            ['pgrep', '-x', 'obexd'],
+            timeout=5, capture_output=True, text=True,
+        )
+        pids = [p for p in r.stdout.split() if p.strip().isdigit()]
+        if pids:
+            print(f'[adapter] killing lingering obexd pids: {" ".join(pids)}')
+            subprocess.run(['kill', '-TERM', *pids],
+                           timeout=5, capture_output=True, text=True)
+            stopped = True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    if not stopped:
+        print('[adapter] no obex daemon running (good)')
+    return stopped
+
+
+def _adapter_pollution_reasons(bus:SystemBus, adapter_path:str) -> list[str]:
+    """Return human-readable reasons the adapter looks like a hybrid device."""
+    if adapter_path is None:
+        return []
+    reasons = []
+    try:
+        adapter = bus.get_object(BLUEZ_SERVICE_NAME, adapter_path)
+        props = Interface(adapter, DBUS_PROPERTIES_INTERFACE)
+
+        cod = int(props.Get(BLUEZ_ADAPTER_INTERFACE, 'Class'))
+        service_bits = (cod >> 13) & 0x7FF
+        bad_svc = service_bits & ~_COD_SERVICE_BITS_BENIGN
+        if bad_svc:
+            reasons.append(
+                f'CoD service bits 0x{bad_svc:03x} '
+                f'[{_decode_service_class_bits(bad_svc)}]')
+
+        uuids = [str(u) for u in props.Get(BLUEZ_ADAPTER_INTERFACE, 'UUIDs')]
+        forbidden = sorted({
+            short for u in uuids
+            if (short := _uuid_to_short(u)) in _FORBIDDEN_ADAPTER_UUID_SHORTS
+        })
+        if forbidden:
+            tagged = [f'{s} ({_UUID_TAGS.get(s, "?")})' for s in forbidden]
+            reasons.append('forbidden adapter UUIDs: ' + ', '.join(tagged))
+    except Exception as e:
+        reasons.append(f'could not read adapter state: {e}')
+    return reasons
+
+
+def check_adapter_pollution() -> list[str]:
+    """One-shot adapter pollution check for start.sh ExecStartPre.
+
+    Connects to system D-Bus, finds hci0, returns pollution reasons (empty
+    if clean). Safe to call as root before the worker process starts.
+    """
+    try:
+        DBusGMainLoop(set_as_default=True)
+        bus = SystemBus()
+        obj = bus.get_object(BLUEZ_SERVICE_NAME, '/')
+        mgr = dbus.Interface(obj, DBUS_OBJECT_MAPPER_INTERFACE)
+        adapter_path = None
+        for path, interfaces in mgr.GetManagedObjects().items():
+            if BLUEZ_ADAPTER_INTERFACE in interfaces:
+                adapter_path = str(path)
+                break
+        if adapter_path is None:
+            return ['no bluez adapter present']
+        return _adapter_pollution_reasons(bus, adapter_path)
+    except Exception as e:
+        return [f'{type(e).__name__}: {e}']
 
 
 def _stringify(value):
@@ -214,10 +509,15 @@ class ToothkeyHandler:
 
     server_mac_address:str = None
     client_mac_address:str = None
-    # Human-readable name advertised by the client (iPhone's device name,
-    # e.g. "smartnix"). Populated on InterfacesAdded for the connected
-    # device and cleared on disconnect. The tray UI reads this to label
-    # the "Disconnect ..." menu item.
+    # Human-readable name advertised by the client (iPhone's device
+    # name, e.g. "smartnix"). Resolved from BlueZ for the connected
+    # MAC in wait_for_client and cleared on disconnect. The tray UI
+    # reads this to label the "Disconnect ..." menu item.
+    #
+    # Only ever set from the address we are actually connected to.
+    # Device-appeared events are not a safe source: they fire for
+    # every device in radio range, so using them overwrites the real
+    # peer's name with whichever stranger advertised most recently.
     client_display_name:str = None
 
     client_control_socket:socket = None
@@ -229,6 +529,8 @@ class ToothkeyHandler:
     _disconnect_event = threading.Event()
     _watcher_thread:threading.Thread = None
     _keepalive_thread:threading.Thread = None
+    _hid_send_queue:queue.SimpleQueue = None
+    _hid_sender_thread:threading.Thread = None
     _lock = threading.Lock()
 
     _glib_mainloop = None
@@ -336,6 +638,15 @@ class ToothkeyHandler:
     connected:bool = False
     _running:bool = False
 
+    # Cleared the first time btmgmt proves unusable (absent, or hanging
+    # until its timeout). CoD gets reapplied several times during
+    # startup, so retrying a binary that always times out costs seconds
+    # of dead wait per attempt. hciconfig is the fallback, and
+    # /etc/bluetooth/main.conf `Class` is the persistent authority in
+    # any case — BlueZ recomputes CoD from it plus the registered SDP
+    # service classes, whichever tool asked last.
+    _btmgmt_usable:bool = True
+
     @classmethod
     def initialize(cls):
         """One-time setup: DBus, HID profile, listening sockets, adapter state.
@@ -418,6 +729,18 @@ class ToothkeyHandler:
         _bdiag('init: verify_adapter_powered')
         cls._verify_adapter_powered(bus, adapter_path)
 
+        pollution = _adapter_pollution_reasons(bus, adapter_path)
+        if pollution:
+            print('[adapter] pollution detected before HID registration: '
+                  + '; '.join(pollution))
+            quiet_obex_daemons()
+            pollution = _adapter_pollution_reasons(bus, adapter_path)
+            if pollution:
+                print('[adapter] still polluted after obex cleanup: '
+                      + '; '.join(pollution)
+                      + ' (ExecStartPre should restart bluetooth when '
+                      'installed; otherwise run `./start.sh --reset-bluez`)')
+
         _bdiag('init: set_adapter_alias')
         cls.set_adapter_alias(bus, adapter_path, device_name)
 
@@ -440,6 +763,42 @@ class ToothkeyHandler:
         cls._verify_class_of_device(bus, adapter_path)
         _bdiag('init: _log_adapter_class')
         cls._log_adapter_class(bus, adapter_path)
+
+        post_pollution = _adapter_pollution_reasons(bus, adapter_path)
+        if post_pollution:
+            print('[adapter] pollution still present after HID registration: '
+                  + '; '.join(post_pollution))
+            attribution = _attribute_pollution(post_pollution)
+            if attribution:
+                print(f'[adapter] {attribution}')
+
+            # Re-registering HID only helps when the pollution came from
+            # something we just stopped — i.e. obexd. When PipeWire owns
+            # the UUIDs they come straight back, and tearing our HID
+            # profile down and up again for nothing is a real risk: a
+            # phone probing SDP during that window sees no HID at all.
+            if _attribute_pollution(post_pollution).startswith('owner: obexd'):
+                print('[adapter] re-registering HID profile after obex '
+                      'cleanup')
+                quiet_obex_daemons(force=True)
+                unregister_hid_profile_with_bluez(bus)
+                register_hid_profile_with_bluez(bus, device_name)
+                cls._verify_class_of_device(bus, adapter_path)
+                cls._log_adapter_class(bus, adapter_path)
+                post_pollution = _adapter_pollution_reasons(bus, adapter_path)
+
+            if post_pollution:
+                # Not necessarily a fault. The CoD major/minor still say
+                # Peripheral/Keyboard, and iOS has been observed binding
+                # HID with these extra service bits set. The thing that
+                # decides it is whether the peer sends a substantive HID
+                # transaction once connected, which the phantom-session
+                # watchdog reports as "engaged HID".
+                print('[adapter] leaving the above in place: CoD major/minor '
+                      'are still Peripheral/Keyboard, which is what iOS '
+                      'matches on. If iOS does refuse HID, the log line to '
+                      'look for is "phantom-watch"; `./start.sh '
+                      '--reset-bluez` is the bigger hammer.')
 
         _bdiag('init: _log_bluetoothd_cmdline')
         cls._log_bluetoothd_cmdline()
@@ -625,6 +984,10 @@ class ToothkeyHandler:
         # subsequent run the device is already known to BlueZ so
         # InterfacesAdded never fires for it.
         cls.client_display_name = cls._resolve_display_name(cls.client_mac_address)
+        if cls.client_display_name == cls.client_mac_address:
+            # BlueZ hasn't learned the peer's name yet; keep looking so
+            # the tray menu doesn't sit on a raw MAC all session.
+            cls._start_name_refresh(cls.client_mac_address)
         # Reset the per-session "iOS sent us a substantive HID
         # transaction" set BEFORE flipping connected=True so any
         # race with _watch_connection / _handle_control_transaction
@@ -651,6 +1014,8 @@ class ToothkeyHandler:
             name='toothkey-hid-keepalive',
             daemon=True)
         cls._keepalive_thread.start()
+
+        cls._start_hid_sender()
 
         # Phantom-session watchdog: only relevant when WE initiated
         # the HID L2CAPs. Inbound accept means iOS opened the channels
@@ -710,17 +1075,12 @@ class ToothkeyHandler:
 
     @classmethod
     def _send_control(cls, payload:bytes):
-        """Blind-send a byte string on the HID control channel. Used
-        for HANDSHAKE and DATA responses to host transactions.
-        Any errors imply the peer is already gone — we'll pick that
-        up on the next recv() iteration and tear down there."""
-        sock = cls.client_control_socket
-        if sock is None:
-            return
-        try:
-            sock.send(payload)
-        except OSError as e:
-            print(f'[hid] control send failed ({e}); link probably gone')
+        """Queue a byte string on the HID control channel.
+
+        HANDSHAKE / DATA replies must not block the control-channel
+        watcher thread — a slow iOS link can stall recv() processing
+        if we did synchronous sends here."""
+        cls._safe_send('client_control_socket', payload)
 
     @classmethod
     def _handshake(cls, result_code:int):
@@ -1012,6 +1372,7 @@ class ToothkeyHandler:
                     setattr(cls, attr, None)
 
         cls._disconnect_event.set()
+        cls._stop_hid_sender()
         # Kick the reconnect watchdog so it tries to page the peer
         # right away instead of waiting out its current sleep — this
         # is the same reflex a real BT keyboard has when it loses
@@ -1251,13 +1612,14 @@ class ToothkeyHandler:
         """Look up a peer's human-readable name from BlueZ.
 
         Returns Device1.Name if set, else Device1.Alias, else the MAC
-        as a last-resort fallback. We need this on every (re)connect,
-        not just the first pairing: on subsequent runs the device
-        already exists in BlueZ's storage so no `InterfacesAdded`
-        signal fires, and the on_interfaces_added handler that
-        normally caches client_display_name never runs. Without this
-        helper the tray menu falls back to `Disconnect <MAC>` instead
-        of `Disconnect <peer name>`.
+        as a last-resort fallback. This is the only source of
+        client_display_name, and it is keyed on the MAC we are actually
+        connected to, so the tray menu can never end up labelled with
+        some passing stranger's address.
+
+        The MAC fallback is reachable: BlueZ may not have read the
+        peer's GAP name yet at the moment the HID channels come up.
+        `_start_name_refresh` retries in the background for that case.
         """
         if not mac_address:
             return mac_address or ''
@@ -1288,6 +1650,35 @@ class ToothkeyHandler:
         except Exception as e:
             _tlog(f'[name-lookup] {mac_address}: {type(e).__name__}: {e}')
         return mac_address
+
+    @classmethod
+    def _start_name_refresh(cls, mac_address:str) -> None:
+        """Re-resolve the peer's name in the background for a while.
+
+        BlueZ populates Device1.Name from the remote name request,
+        which can land after our HID channels are already up — so the
+        first lookup legitimately returns the MAC. Retry on a short
+        backoff and stop as soon as a real name appears, so the tray
+        menu settles on "Disconnect smartnix" rather than staying on
+        the raw address for the whole session.
+        """
+        if not mac_address:
+            return
+
+        def run():
+            for delay in (1.0, 2.0, 4.0, 8.0):
+                if cls._disconnect_event.wait(delay):
+                    return                      # peer went away
+                if cls.client_mac_address != mac_address:
+                    return                      # different session now
+                name = cls._resolve_display_name(mac_address)
+                if name and name != mac_address:
+                    cls.client_display_name = name
+                    _tlog(f'[name-lookup] {mac_address} resolved to {name!r}')
+                    return
+
+        threading.Thread(target=run, daemon=True,
+                         name='toothkey-name-refresh').start()
 
     @classmethod
     def _try_outbound_reconnect(cls, mac_address:str) -> bool:
@@ -1376,7 +1767,13 @@ class ToothkeyHandler:
                 except OSError:
                     # Bind is best-effort; kernel picks hci0 anyway.
                     pass
-            _tlog(f'[reconnect] paging {mac_address}...')
+            # Throttled: when the peer is simply elsewhere this retries
+            # every 30s indefinitely, and an unthrottled line per attempt
+            # buries the ones that matter (the page that finally
+            # succeeds is logged in full below, every time).
+            _tlog_throttled(f'paging:{mac_address}',
+                            f'[reconnect] paging {mac_address}...',
+                            interval_s=120.0)
             t0 = time.monotonic()
             sdp_sock.connect((mac_address, SDP_PSM))
             # Back to blocking-mode with no timeout so the holder
@@ -1458,8 +1855,41 @@ class ToothkeyHandler:
             # Don't race.
             return False
 
+        # iOS frequently accepts PSM 0x11 immediately and then refuses
+        # 0x13 for a few seconds, which is a near-miss worth retrying
+        # rather than abandoning: the ACL is up and being held open by
+        # the caller's SDP socket, so a retry costs a round trip, while
+        # giving up costs a whole watchdog cadence (observed: control in
+        # 0.29s, interrupt timing out, then both connecting in under
+        # 0.3s on the next page 45s later).
+        for attempt in range(1, _HID_OUTBOUND_ATTEMPTS + 1):
+            if cls.connected or not cls._running:
+                return False
+            if cls._try_open_hid_outbound_once(mac_address, attempt):
+                return True
+            if attempt < _HID_OUTBOUND_ATTEMPTS:
+                # Bail out early if the peer has gone again — retrying
+                # against a dead ACL just burns the connect timeout.
+                if not cls._peer_acl_connected(mac_address):
+                    _tlog(f'[reconnect] {mac_address}: ACL gone, not '
+                          f'retrying HID open')
+                    return False
+                cls._reconnect_wake.wait(timeout=_HID_OUTBOUND_RETRY_GAP_S)
+        return False
+
+    @classmethod
+    def _try_open_hid_outbound_once(cls, mac_address:str,
+                                    attempt:int) -> bool:
+        """One attempt at opening both HID L2CAP channels outbound.
+
+        Returns True if both opened and were handed to wait_for_client.
+        Fresh sockets every call: a socket whose connect() failed can't
+        be reused.
+        """
         ctrl = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP)
         intr = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP)
+        suffix = (f' (attempt {attempt}/{_HID_OUTBOUND_ATTEMPTS})'
+                  if attempt > 1 else '')
         try:
             # Match the security level we demand on our listening
             # sockets. iOS's HID Host side refuses to accept an
@@ -1479,18 +1909,18 @@ class ToothkeyHandler:
                 except OSError:
                     pass
 
-            ctrl.settimeout(10.0)
-            intr.settimeout(10.0)
+            ctrl.settimeout(_HID_OUTBOUND_CONNECT_TIMEOUT_S)
+            intr.settimeout(_HID_OUTBOUND_CONNECT_TIMEOUT_S)
 
             _tlog(f'[reconnect] {mac_address}: trying peripheral-'
-                  f'initiated HID L2CAP 0x11 (control)')
+                  f'initiated HID L2CAP 0x11 (control){suffix}')
             t0 = time.monotonic()
             ctrl.connect((mac_address, CONTROL_CHANNEL))
             _tlog(f'[reconnect] {mac_address}: HID control connected '
                   f'after {time.monotonic()-t0:.2f}s')
 
             _tlog(f'[reconnect] {mac_address}: trying peripheral-'
-                  f'initiated HID L2CAP 0x13 (interrupt)')
+                  f'initiated HID L2CAP 0x13 (interrupt){suffix}')
             t1 = time.monotonic()
             intr.connect((mac_address, INTERRUPT_CHANNEL))
             _tlog(f'[reconnect] {mac_address}: HID interrupt connected '
@@ -1503,9 +1933,9 @@ class ToothkeyHandler:
             return True
         except OSError as e:
             _tlog(f'[reconnect] {mac_address}: peripheral-initiated '
-                  f'HID failed errno={e.errno}: {e}')
-            for s in (ctrl, intr):
-                try: s.close()
+                  f'HID failed errno={e.errno}: {e}{suffix}')
+            for sock_obj in (ctrl, intr):
+                try: sock_obj.close()
                 except OSError: pass
             return False
 
@@ -1901,6 +2331,91 @@ class ToothkeyHandler:
         except Exception as e:
             print(f'[agent] could not reassert default: {e}')
 
+    # Pairing-attempt bookkeeping, keyed by peer address. A device that
+    # keeps reappearing (LE addresses rotate, and a phone out of range
+    # pages repeatedly) must not produce an unbounded stream of Pair()
+    # calls: each one occupies the baseband for up to a page timeout,
+    # which is time the adapter isn't spending on our real peer.
+    _pair_attempts:dict = {}
+    _PAIR_RETRY_INTERVAL_S:float = 30.0
+    _PAIR_MAX_ATTEMPTS_PER_PEER:int = 5
+
+    @classmethod
+    def _is_interesting_path(cls, path) -> bool:
+        """Is this BlueZ device path a peer we actually care about?
+
+        True for the peer we're connected to, the one we last cached,
+        and the one we're paused on. Used to keep the log about our own
+        link rather than about every device in radio range.
+        """
+        if not path:
+            return False
+        path = str(path)
+        for mac in (cls.client_mac_address, cls._paused_mac):
+            if mac and path.endswith(mac.replace(':', '_')):
+                return True
+        return False
+
+    @classmethod
+    def _classic_pairing_candidate(cls, dev:dict):
+        """Is this newly-appeared BlueZ device one we should drive SSP for?
+
+        Returns (True, '') for a plausible classic-HID host, or
+        (False, reason) with a short human-readable reason otherwise.
+
+        Without this gate, every device in radio range gets a Pair()
+        call: it sends pairing requests to strangers, fills BlueZ's
+        storage with junk entries, and ties up the baseband for a page
+        timeout each time — time the adapter isn't spending on our real
+        peer.
+
+        The discriminator is AddressType. 'random' is an LE privacy
+        address, which phones, watches and earbuds rotate every ~15
+        minutes, so a running scan produces an endless supply of them;
+        none can host a classic HID session. Every real BR/EDR peer has
+        a public address.
+
+        Class of Device is deliberately NOT required. It would be a
+        second useful signal — LE-only entries never have one — but a
+        BR/EDR peer's Class may not be populated in the properties that
+        come with InterfacesAdded, and refusing to pair with a device
+        whose Class hasn't landed yet would break first-time pairing,
+        the one case that most needs us to drive SSP. So its absence is
+        reported and tolerated; _pair_attempt_allowed caps the damage
+        if a public-address LE device does slip through.
+        """
+        addr_type = str(dev.get('AddressType') or 'public')
+        if addr_type != 'public':
+            return False, f'LE {addr_type} address, not a classic HID host'
+        if bool(dev.get('Blocked')):
+            return False, 'blocked by BlueZ'
+        if bool(dev.get('Paired')):
+            return False, 'already paired'
+        return True, ''
+
+    @classmethod
+    def _pair_attempt_allowed(cls, addr:str) -> bool:
+        """Rate-limit Pair() per peer address.
+
+        Caps both frequency and total attempts. The cap is per worker
+        run, so a user who genuinely wants to retry a stuck pairing
+        gets a clean slate from the tray's Restart.
+        """
+        if not addr:
+            return False
+        now = time.monotonic()
+        count, last = cls._pair_attempts.get(addr, (0, 0.0))
+        if count >= cls._PAIR_MAX_ATTEMPTS_PER_PEER:
+            _tlog_throttled(
+                f'paircap:{addr}',
+                f'[pair] {addr}: {count} attempts this run, not trying '
+                f'again (Restart to reset)')
+            return False
+        if now - last < cls._PAIR_RETRY_INTERVAL_S:
+            return False
+        cls._pair_attempts[addr] = (count + 1, now)
+        return True
+
     @classmethod
     def _subscribe_to_device_events(cls, bus:SystemBus):
         """Log BlueZ Device1 lifecycle events so pairing failures aren't silent.
@@ -1917,11 +2432,25 @@ class ToothkeyHandler:
                 if not dev: return
                 addr = dev.get('Address')
                 name = dev.get('Name') or dev.get('Alias')
-                # Cache the name so the tray can label "Disconnect <name>"
-                # without having to do its own D-Bus lookup.
-                if addr:
-                    cls.client_display_name = str(name) if name else str(addr)
+
+                # Anything the adapter can hear shows up here, and while
+                # a scan is running that is every phone, watch and pair
+                # of earbuds in radio range. Decide first whether this
+                # device is any of our business; most are not, and
+                # logging each one at full volume is what turns this
+                # file into hundreds of megabytes.
+                candidate, why_not = cls._classic_pairing_candidate(dev)
+                if not candidate:
+                    _tlog_throttled(
+                        f'bystander:{addr}',
+                        f'[bluez] ignoring {addr} "{name}": {why_not}')
+                    return
+
                 _tlog(f'[bluez] device appeared: {addr} "{name}" at {path}')
+                if dev.get('Class') is None:
+                    _tlog(f'[bluez] {addr}: no Class of Device yet; treating '
+                          f'as a classic peer on the strength of its public '
+                          f'address')
                 interesting = ('Paired', 'Bonded', 'Connected', 'Trusted', 'Blocked', 'LegacyPairing')
                 snapshot = {k: _stringify(dev.get(k)) for k in interesting if k in dev}
                 if snapshot:
@@ -1947,11 +2476,16 @@ class ToothkeyHandler:
                 already_connected = bool(dev.get('Connected'))
                 if already_connected:
                     _tlog(f'[pair] skipping Device1.Pair() — peer paged us (Connected=True at appearance); letting it drive SSP')
-                else:
+                elif cls._pair_attempt_allowed(str(addr)):
                     cls._initiate_pairing(bus, str(path))
 
             def on_interfaces_removed(path, interfaces):
-                if 'org.bluez.Device1' in interfaces:
+                if 'org.bluez.Device1' not in interfaces:
+                    return
+                # Only our own peers are worth a line. BlueZ ages out
+                # every LE advertiser it saw, which is a removal event
+                # per device per few minutes, all day.
+                if cls._is_interesting_path(path):
                     _tlog(f'[bluez] device removed: {path}')
 
             mgr.connect_to_signal('InterfacesAdded', on_interfaces_added)
@@ -1959,18 +2493,35 @@ class ToothkeyHandler:
 
             def on_props_changed(interface, changed, invalidated, path=None):
                 if interface != 'org.bluez.Device1': return
+                interesting_path = cls._is_interesting_path(path)
                 if changed:
-                    # Log everything so we can see exactly what BlueZ is doing
-                    # during pairing/encryption setup.
-                    pretty = {str(k): _stringify(v) for k, v in changed.items()}
-                    _tlog(f'[bluez] {path}: {pretty}')
                     # Track the peer's ACL transitioning True -> False
                     # so the reconnect watchdog can tell "iOS accepted
                     # then rejected us within seconds" (churn) from
-                    # a benign drop long after the page.
+                    # a benign drop long after the page. Do this before
+                    # any logging decision — it must happen for our
+                    # peer whether or not we print anything.
                     if 'Connected' in changed and not bool(changed['Connected']):
                         cls._last_peer_acl_drop_at = time.monotonic()
-                if invalidated:
+
+                    # Drop the properties that change purely because
+                    # radio conditions did. A scanning adapter emits
+                    # these for every device in range several times a
+                    # second and they say nothing about pairing or the
+                    # link we care about.
+                    pretty = {str(k): _stringify(v)
+                              for k, v in changed.items()
+                              if str(k) not in _NOISY_DEVICE_PROPS}
+                    if pretty:
+                        if interesting_path:
+                            _tlog(f'[bluez] {path}: {pretty}')
+                        else:
+                            # A bystander changing a real property is
+                            # worth knowing about, but only rarely.
+                            _tlog_throttled(
+                                f'props:{path}',
+                                f'[bluez] {path}: {pretty}')
+                if invalidated and interesting_path:
                     _tlog(f'[bluez] {path}: invalidated={[str(x) for x in invalidated]}')
 
             cls._device_signal_match = bus.add_signal_receiver(
@@ -2142,6 +2693,9 @@ class ToothkeyHandler:
         touching any existing bonds."""
         from worker import _wdiag as _bdiag
 
+        _bdiag('prepare_adapter: quiet_obex_daemons')
+        quiet_obex_daemons()
+
         # Bring the kernel HCI interface up FIRST. If it's in IFF_DOWN
         # state then bluetoothctl power on below will fake-succeed
         # (bluez just records its desired state) but the radio will
@@ -2206,7 +2760,7 @@ class ToothkeyHandler:
                 # major/minor already say Keyboard.
                 service_bits = (cod >> 13) & 0x7FF
                 cod_ok = (major == 0x05 and (minor & 0x10)
-                          and service_bits == 0)
+                          and (service_bits & ~_COD_SERVICE_BITS_BENIGN) == 0)
                 if cod_ok:
                     return
                 svc_names = _decode_service_class_bits(service_bits)
@@ -2224,14 +2778,12 @@ class ToothkeyHandler:
         try:
             cod_final = int(props.Get(BLUEZ_ADAPTER_INTERFACE, 'Class'))
             svc_bits_final = (cod_final >> 13) & 0x7FF
-            if svc_bits_final != 0:
+            if svc_bits_final != 0 and (svc_bits_final & ~_COD_SERVICE_BITS_BENIGN):
                 print(f'[adapter] WARNING: adapter CoD 0x{cod_final:06x} still '
                       f'carries service-class bits [{_decode_service_class_bits(svc_bits_final)}]. '
                       'iOS will see us as a hybrid device and refuse HID. '
-                      'This is caused by bluetoothd plugins or bluez-obexd '
-                      'registering Audio/Telephony/OBEX UUIDs. Run '
-                      '`./start.sh --reset-bluez` to refresh the -P list '
-                      'and stop obex services.')
+                      'The worker will attempt auto-remediation on next start; '
+                      'if this persists run `./start.sh --reset-bluez`.')
                 return
         except Exception:
             pass
@@ -2364,25 +2916,41 @@ class ToothkeyHandler:
         # up on pairing. hciconfig fallback is effectively instantaneous,
         # and /etc/bluetooth/main.conf `Class = 0x000540` is the real
         # persistent authority anyway. 3 s is plenty if btmgmt is healthy.
-        try:
-            _bdiag(f'set_class_of_device: running btmgmt class {major} {minor_byte}')
-            result = subprocess.run(
-                ['btmgmt', '--index', '0', 'class', str(major), str(minor_byte)],
-                capture_output=True, text=True, timeout=3,
-            )
-            _bdiag(f'set_class_of_device: btmgmt rc={result.returncode}')
-            if result.returncode == 0:
-                print(f'[adapter] class of device set to {cod_hex} via btmgmt '
-                      f'(major={major} minor={minor_byte})')
-                return
-            else:
-                print(f'[adapter] btmgmt class failed: {result.stderr.strip() or result.stdout.strip()}')
-        except FileNotFoundError:
-            _bdiag('set_class_of_device: btmgmt not found; falling back to hciconfig')
-        except subprocess.TimeoutExpired:
-            _bdiag('set_class_of_device: btmgmt TIMED OUT after 3s — falling back')
-            print('[adapter] btmgmt class TIMED OUT after 3s — falling back to hciconfig '
-                  '(main.conf Class=0x000540 is the persistent authority)')
+        if cls._btmgmt_usable:
+            try:
+                _bdiag(f'set_class_of_device: running btmgmt class {major} {minor_byte}')
+                result = subprocess.run(
+                    ['btmgmt', '--index', '0', 'class', str(major), str(minor_byte)],
+                    capture_output=True, text=True, timeout=3,
+                    # btmgmt falls into an interactive prompt when it
+                    # doesn't get what it expects on the command line,
+                    # and would then block on our stdin until the
+                    # timeout. Hand it EOF instead.
+                    stdin=subprocess.DEVNULL,
+                )
+                _bdiag(f'set_class_of_device: btmgmt rc={result.returncode}')
+                if result.returncode == 0:
+                    print(f'[adapter] class of device set to {cod_hex} via btmgmt '
+                          f'(major={major} minor={minor_byte})')
+                    return
+                else:
+                    print(f'[adapter] btmgmt class failed: {result.stderr.strip() or result.stdout.strip()}')
+            except FileNotFoundError:
+                cls._btmgmt_usable = False
+                _bdiag('set_class_of_device: btmgmt not found; falling back to hciconfig')
+            except subprocess.TimeoutExpired:
+                # btmgmt hangs outright on some BlueZ builds, including
+                # for --help, so a timeout here says the binary is
+                # unusable rather than that this one call was unlucky.
+                # Stop calling it: CoD is reapplied several times per
+                # startup and 3s of dead wait each time delays HID
+                # registration enough for a probing iPhone to give up.
+                cls._btmgmt_usable = False
+                _bdiag('set_class_of_device: btmgmt TIMED OUT after 3s — '
+                       'marking unusable for this run')
+                print('[adapter] btmgmt class TIMED OUT after 3s; not using it '
+                      'again this run — falling back to hciconfig '
+                      '(main.conf Class=0x000540 is the persistent authority)')
 
         # Fallback: hciconfig, only if btmgmt isn't installed. Note this
         # writes to the controller directly and bluez may overwrite it.
@@ -2431,6 +2999,72 @@ class ToothkeyHandler:
         return sock
 
     @classmethod
+    def _start_hid_sender(cls):
+        """Spin up the per-session thread that owns all blocking
+        client_socket.send() calls, so the keyboard reader and the
+        control-channel watcher never stall when iOS is slow to drain
+        HID reports."""
+        cls._stop_hid_sender()
+        cls._hid_send_queue = queue.SimpleQueue()
+        cls._hid_sender_thread = threading.Thread(
+            target=cls._hid_sender_loop,
+            daemon=True,
+            name='toothkey-hid-sender',
+        )
+        cls._hid_sender_thread.start()
+
+    @classmethod
+    def _stop_hid_sender(cls):
+        """Drain and join the sender thread for the current session."""
+        q = cls._hid_send_queue
+        if q is not None:
+            try:
+                q.put(_HID_SEND_STOP)
+            except Exception:
+                pass
+        t = cls._hid_sender_thread
+        if (t is not None and t.is_alive()
+                and threading.current_thread() is not t):
+            t.join(timeout=2.0)
+        cls._hid_send_queue = None
+        cls._hid_sender_thread = None
+
+    @classmethod
+    def _hid_sender_loop(cls):
+        """Blocking-send worker: dequeue (attr, data) pairs and push
+        them to the live client L2CAP sockets. Runs for one BT session
+        then exits on _HID_SEND_STOP."""
+        while True:
+            q = cls._hid_send_queue
+            if q is None:
+                return
+            try:
+                item = q.get(timeout=0.5)
+            except queue.Empty:
+                if not cls._running and q.empty():
+                    return
+                continue
+            if item is _HID_SEND_STOP:
+                return
+            attr, data = item
+            cls._blocking_send(attr, data)
+
+    @classmethod
+    def _blocking_send(cls, attr:str, data:bytes):
+        """Perform one blocking socket send on the sender thread."""
+        if data is None:
+            return
+        with cls._lock:
+            sock = getattr(cls, attr)
+            if sock is None or not cls.connected:
+                return
+        try:
+            sock.send(data)
+        except (OSError, BrokenPipeError) as e:
+            print(f'connection lost during send: {e}')
+            cls._drop_client()
+
+    @classmethod
     def send_to_control_channel(cls, data:bytes):
         cls._safe_send('client_control_socket', data)
 
@@ -2440,16 +3074,20 @@ class ToothkeyHandler:
 
     @classmethod
     def _safe_send(cls, attr:str, data:bytes):
+        """Enqueue a HID report for the sender thread.
 
-        if data is None: return
-
-        with cls._lock:
-            sock = getattr(cls, attr)
-            if sock is None or not cls.connected:
-                return
-
+        Never blocks on the Bluetooth socket. The caller is the keyboard
+        reader thread, which must stay free to drain /dev/input: a
+        sluggish iOS link must not stall key capture, and the grab must
+        always be releasable."""
+        if data is None:
+            return
+        if not cls.connected:
+            return
+        q = cls._hid_send_queue
+        if q is None:
+            return
         try:
-            sock.send(data)
-        except (OSError, BrokenPipeError) as e:
-            print(f'connection lost during send: {e}')
-            cls._drop_client()
+            q.put((attr, data))
+        except Exception:
+            pass

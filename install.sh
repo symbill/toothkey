@@ -161,7 +161,7 @@ cat > "$SERVICE_PATH" <<EOF
 Description=Toothkey BlueZ HID keyboard worker (root)
 Documentation=https://github.com/bklein/toothkey
 After=bluetooth.service
-Requires=bluetooth.service
+Wants=bluetooth.service
 
 [Service]
 Type=simple
@@ -178,6 +178,7 @@ ExecStartPre=/bin/chmod 0755 /run/toothkey
 # the worker. Without this a prior root-only run would cause the
 # user tray to EACCES on its first open().
 ExecStartPre=/bin/chown -R $REAL_UID:$REAL_GID $SCRIPT_DIR/logs
+ExecStartPre=/bin/bash $SCRIPT_DIR/start.sh --quiet-obex
 
 # Worker proper. --socket is in /run/toothkey/ (persistent across
 # user sessions); the env vars below tell the worker to chown the
@@ -194,11 +195,13 @@ Environment=TOOTHKEY_ACCEPT_TIMEOUT=0
 Environment=TOOTHKEY_INSTALLED=1
 ExecStart=$PYTHON3 -u $SCRIPT_DIR/worker.py --socket /run/toothkey/ipc.sock
 
-# The worker exits when the tray disconnects (clean shutdown via UDS
-# or an uncaught error). Auto-restart so a tray re-launch — e.g. the
-# user clicking Restart, or the user logging out and back in —
-# transparently gets a fresh worker. RestartSec=2 avoids a tight
-# loop if the worker is crashing immediately.
+# The worker outlives any individual tray: it keeps its listening
+# socket open and accepts a new tray whenever the old one goes away, so
+# a tray restart, a logout/login or a tray crash does not need the
+# worker restarted (and must not restart it — that would drop the
+# Bluetooth link for no reason). Restart=always is here for the worker
+# genuinely dying; RestartSec=2 avoids a tight loop if it is crashing
+# immediately.
 #
 # RestartPreventExitStatus=42 carves out the "user clicked Exit in
 # the tray menu" path: tray sends `shutdown` over the UDS, worker

@@ -1,36 +1,45 @@
 """Keyboard capture + HID report generation.
 
 All user-facing control (grab/ungrab, shutdown) is driven by the tray
-menu. With ONE exception — Ctrl+V — every key pressed while grab_mode
-is on is forwarded verbatim to the connected Bluetooth host. Ctrl+V
-is special-cased to "paste the Linux desktop clipboard into the BT
-peer as simulated keystrokes", because (a) iOS doesn't bind Ctrl+V to
-paste anyway (it expects Cmd+V on hardware keyboards) and (b) there
-is otherwise no easy way to ferry text from the Linux clipboard into
-an iPhone over a BT-HID link. See `_do_clipboard_paste` for the
-mechanics.
+menu. With TWO exceptions every key pressed while grab_mode is on is
+forwarded verbatim to the connected Bluetooth host:
+
+    Ctrl+V              pastes the Linux desktop clipboard into the
+                        peer as synthesised keystrokes, because iOS
+                        doesn't bind Ctrl+V to paste anyway (it expects
+                        Cmd+V on hardware keyboards) and there is
+                        otherwise no way to ferry text from a Linux app
+                        into an iPhone over a BT-HID link. See
+                        `_do_clipboard_paste`.
+    Ctrl+Alt+Shift+Esc  releases the keyboard grab. Capture is a kernel
+                        EVIOCGRAB (see keyboard_evdev), so unlike the
+                        old X11 grab it cannot be escaped by switching
+                        windows or killing the compositor — this chord
+                        is the escape hatch that works even if the tray
+                        or the Bluetooth link is wedged.
+
+Capture lives in keyboard_evdev.KeyboardGrabber, which reads
+/dev/input/event* directly. This module is the policy layer around it:
+when to hold a grab, what the two consumed chords do, and how to type
+out a clipboard paste.
 
 Lifecycle:
-    - `start()` spins up a pynput Listener in the current thread
-      (blocking join). Called repeatedly by the worker while a BT
-      client is connected.
-    - `set_grab_mode(on)` flips the grab flag from outside (tray
-      menu). Since pynput bakes `suppress` in at construction, we
-      tear down the listener; the outer loop reconstructs it with
-      the new flag.
-    - `shutdown()` flips `active=False` and stops the listener so
-      the worker's main loop exits.
+    - `set_grab_mode(on)` takes or releases the grab. It returns the
+      state actually reached, so a grab that could not be taken is
+      reported as off rather than silently pretending.
+    - `stop_listener()` drops the grab but remembers grab_mode, for
+      when the Bluetooth link blips; `start_listener()` re-takes it
+      when the peer comes back.
+    - `shutdown()` flips `active=False` and releases the grab so the
+      worker's main loop exits.
 
-Lazy-pynput rationale:
-    pynput opens a connection to the X server at import time (on X11)
-    or to the compositor (Wayland). When this module is imported
-    pre-login — which happens when the worker is started by systemd
-    at boot, before anyone has logged in graphically — that import
-    crashes with "Bad display name ''". So we DON'T import pynput at
-    module load: we import it inside _ensure_pynput_loaded() which is
-    called only right before we actually need to build a Listener,
-    and only after the tray has connected and given us its DISPLAY /
-    WAYLAND_DISPLAY / XAUTHORITY / XDG_RUNTIME_DIR via the handshake.
+Why not pynput:
+    pynput loads its X11 backend whenever DISPLAY is set, and in a
+    Wayland session DISPLAY is XWayland, which only sees key events
+    while an X11 window holds focus. On Plasma 6 almost every window
+    is a native Wayland client, so such a listener observes nothing
+    and `suppress=True` cannot withhold input from the compositor.
+    keyboard_evdev's module docstring has the full rationale.
 """
 
 import os
@@ -39,6 +48,7 @@ import subprocess
 import threading
 import time
 
+import keyboard_evdev
 from common import GlobalContext
 
 
@@ -49,11 +59,10 @@ from common import GlobalContext
 # in the JSON map must have its base character listed here.
 _SHIFTED_PRINTABLE_CHARS = set('!@#$%^&*()_+{}|:"<>?~') | set(string.ascii_uppercase)
 
-# HID modifier-byte bit for left-shift. Mirrors the value in
-# `ToothkeyKeyboardHandler.modifier_key_bitmasks[Key.shift_l]`, but we
-# need it here as a literal because the synth path runs without going
-# through pynput's Key enum (and may run before pynput is loaded if the
-# clipboard read also fails).
+# HID modifier-byte bit for left-shift, per the boot-keyboard spec.
+# Same bit as keyboard_evdev.KEYCODE_TO_MOD_BIT[KEY_LEFTSHIFT]; the
+# clipboard-paste path needs it as a literal because it builds reports
+# character-by-character rather than from held physical keys.
 _HID_MOD_SHIFT_L = 1 << 1
 
 # Minimum gap between back-to-back HID reports during clipboard paste.
@@ -71,10 +80,11 @@ def _read_desktop_clipboard():
     """Read text from the user's desktop clipboard via xclip / wl-paste.
 
     The worker process inherits DISPLAY / WAYLAND_DISPLAY / XAUTHORITY
-    from the tray's `client_hello` handshake, so the same env vars
-    pynput uses for keyboard grab are also what xclip/wl-paste need
-    to reach the user's session. Returns the decoded clipboard text,
-    or None if both helpers are unavailable / errored / empty.
+    from the tray's `client_hello` handshake, which is what lets a root
+    process reach the logged-in user's clipboard. Capture itself no
+    longer needs any of them (see keyboard_evdev), but xclip/wl-paste
+    still do. Returns the decoded clipboard text, or None if both
+    helpers are unavailable / errored / empty.
     """
     # Wayland sessions keep the Wayland clipboard separate from the
     # XWayland (X11) clipboard, and the user's "real" copy lives in
@@ -159,316 +169,225 @@ def _char_to_hid(c: str):
     return (usage, needs_shift)
 
 
-# Populated on first successful pynput load. `None` until then.
-keyboard = None
-
-
-def _ensure_pynput_loaded():
-    """Import pynput.keyboard and populate our lazy class attributes.
-
-    Called from everywhere that needs to reference pynput types.
-    Idempotent after first success; re-raises if the import fails
-    (e.g. no DISPLAY / no X authority yet).
-    """
-    global keyboard
-    if keyboard is not None:
-        return
-    from pynput import keyboard as _kb
-    keyboard = _kb
-
-    # Bitmask positions per the HID Boot Keyboard spec (modifier byte
-    # in report ID 1, usage page 0x07). Each side of each modifier
-    # gets its own bit so the host can tell left-shift from right-shift.
-    # We populate the class-level dict here, on first use, because
-    # keyboard.Key.* only exists after the pynput import above succeeds.
-    ToothkeyKeyboardHandler.modifier_key_bitmasks = {
-        keyboard.Key.ctrl_l:    1 << 0,
-        keyboard.Key.shift_l:   1 << 1,
-        keyboard.Key.alt_l:     1 << 2,
-        keyboard.Key.cmd_l:     1 << 3,
-        keyboard.Key.ctrl_r:    1 << 4,
-        keyboard.Key.shift_r:   1 << 5,
-        keyboard.Key.alt_r:     1 << 6,
-        keyboard.Key.cmd_r:     1 << 7,
-    }
-
-
 class ToothkeyKeyboardHandler:
+    """Owns keyboard capture and the HID reports it produces.
 
-    # Populated lazily by _ensure_pynput_loaded() on first use.
-    # Defined as an empty dict at class scope so attribute-access
-    # paths (e.g. `cls.modifier_key_bitmasks`) don't AttributeError
-    # before we've loaded pynput; they simply miss the `in` check,
-    # which is harmless — the listener isn't running yet either.
-    modifier_key_bitmasks = {}
+    Capture itself lives in keyboard_evdev.KeyboardGrabber; this class
+    is the policy layer the worker drives: when to hold a grab, what to
+    do with the two chords we consume instead of forwarding, and how to
+    synthesise a clipboard paste.
 
-    # Boot Keyboard input report template. [0]=Report Type 0xA1 (DATA),
-    # [1]=Report ID 0x01 (keyboard), [2]=modifier bitmask, [3]=reserved,
-    # [4..9]=up to six simultaneously-pressed non-modifier usage IDs.
-    states = bytearray([
-        0xA1,
-        0x01,
-        0x00,
-        0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ])
+    The grab is only ever held while grab_mode is on. We deliberately
+    don't read the keyboard when we aren't forwarding it.
+    """
 
-    states_size = len(states)
-    states_modifier_keys_index = 2
-    states_input_key_start_index = 4
-    states_input_key_limit = states_size - states_input_key_start_index
+    # The active KeyboardGrabber, or None when not grabbing.
+    _grabber = None
+    # Guards _grabber against concurrent set_grab_mode / shutdown calls
+    # arriving from the IPC reader thread and the BT state machine.
+    _lock = threading.RLock()
 
-    input_key_set = set()
-    input_modifier_key_set = set()
-
-    listener = None
-
-    event_handlers = None
-
-    active = True
-
-    # Set True for the duration of a clipboard-paste synth so we don't
-    # re-enter _do_clipboard_paste from a nested on_press (X11 key
-    # repeat can re-fire on_press for V while we're mid-paste). Also
-    # consulted by on_press / on_release as a "ignore the user's real
-    # keyboard while we drive the BT peer ourselves" interlock.
+    # Set while a clipboard paste is being typed out, so a second
+    # Ctrl+V can't start an overlapping paste.
     paste_in_progress = False
 
-    # True between the Ctrl+V chord press and the matching V release.
-    # X11 auto-repeat will re-fire on_press(V) while V stays down, and
-    # without this flag we'd kick off a fresh paste on every repeat.
-    # Cleared in on_release(V).
-    paste_v_consumed = False
+    # Tells the worker's main loop whether to keep running.
+    active = True
+
+    # Called with the new grab state whenever capture stops for a
+    # reason the user didn't ask for (panic chord, every keyboard
+    # unplugged). Set by worker.py so the tray's icon and menu stay
+    # truthful instead of claiming a grab that is no longer held.
+    on_grab_lost = None
+
+    # ----------------------------- lifecycle ----------------------------
 
     @classmethod
-    def get_event_handlers(cls):
-        if cls.event_handlers is not None:
-            return cls.event_handlers
-        cls.event_handlers = {
-            name: method.__func__.__get__(cls, cls)
-            for name, method in cls.__dict__.items()
-            if type(method) == classmethod and name.startswith('on_')
-        }
-        return cls.event_handlers
+    def set_grab_mode(cls, on: bool) -> bool:
+        """Turn capture on or off. Returns the state actually reached.
 
-    @classmethod
-    def _run_listener_blocking(cls):
-        """Construct the pynput Listener with whatever suppress flag
-        matches the current grab_mode and block on it until stop()
-        is called. Always runs in a dedicated daemon thread so the
-        caller isn't tied to pynput's join() — on X11 the backend
-        sits in XNextEvent and listener.stop() doesn't wake it up
-        reliably if no key event is pending."""
-        if cls.listener is not None and cls.listener.is_alive():
-            return
-
-        # Lazy pynput import — raises ImportError if the worker has no
-        # DISPLAY (e.g. systemd-started, pre-tray-handshake). The caller
-        # has wrapped this in a thread, so we log and bail rather than
-        # crash the whole worker; the user will see "can't grab yet" in
-        # the logs and we'll retry next time they toggle grab.
-        try:
-            _ensure_pynput_loaded()
-        except Exception as e:
-            print(f'[kbd] pynput unavailable ({type(e).__name__}: {e}); '
-                  f'grab requires a connected tray with DISPLAY')
-            return
-
-        event_handlers = cls.get_event_handlers()
-
-        # `suppress=True` on pynput's X11 backend grabs the keyboard so
-        # local apps don't also see the keystrokes — essential when the
-        # iPhone is the intended target. suppress is locked at construct
-        # time, so set_grab_mode() has to stop-and-rebuild to flip it.
-        cls.listener = keyboard.Listener(
-            **event_handlers, suppress=GlobalContext.grab_mode)
-        cls.listener.start()
-        cls.listener.join()
-
-    @classmethod
-    def start_listener(cls):
-        """Spin up the keyboard listener in the background. Returns
-        immediately; the listener runs in a daemon thread until
-        stop_listener() (or grab_mode flipping off) stops it.
-
-        Only called when grab_mode is True — we intentionally don't
-        capture keystrokes at all when we aren't forwarding them.
+        Honest about failure: if the grab can't be taken (not root, no
+        keyboard, another process holds an exclusive grab) this returns
+        False and leaves grab_mode off, so the tray shows "not grabbed"
+        rather than a green tooth that forwards nothing. Callers must
+        use the return value, not assume the requested state.
         """
-        if cls.listener is not None and cls.listener.is_alive():
-            return
-        threading.Thread(
-            target=cls._run_listener_blocking, daemon=True,
-            name='toothkey-kbd-listener',
-        ).start()
+        on = bool(on)
+        with cls._lock:
+            # Already in the requested state, in both senses: the flag
+            # agrees AND capture really is (or isn't) running. Checking
+            # both matters because they can disagree — grab_mode stays
+            # armed across a Bluetooth drop while no grab is held.
+            if on and GlobalContext.grab_mode and cls.is_running():
+                return True
+            if not on and not GlobalContext.grab_mode \
+                    and not cls.is_running():
+                return False
 
-    @classmethod
-    def stop_listener(cls):
-        """Ask the pynput listener to stop. May take a moment to
-        actually return on X11 (stop() doesn't unblock XNextEvent
-        instantly without a pending event), but the listener is a
-        daemon thread so the main BT state machine never waits on it.
-        """
-        listener = cls.listener
-        if listener is not None and listener.is_alive():
-            listener.stop()
+            if not on:
+                cls._stop_grab()
+                GlobalContext.grab_mode = False
+                return False
 
-    @classmethod
-    def set_grab_mode(cls, on: bool):
-        """Flip grab mode from outside (e.g. tray menu). Starts/stops
-        the listener to match: ON spins up a fresh listener with
-        suppress=True; OFF tears the listener down completely so we
-        aren't capturing keystrokes we don't need.
+            if not GlobalContext.is_peer_connected():
+                print('[kbd] refusing to grab: no Bluetooth peer connected')
+                GlobalContext.grab_mode = False
+                return False
 
-        No-op if the requested state already matches.
-        """
-        if bool(on) == bool(GlobalContext.grab_mode):
-            return
-        GlobalContext.grab_mode = bool(on)
-        cls.stop_listener()
-        if on:
-            cls.start_listener()
+            grabber = keyboard_evdev.KeyboardGrabber(
+                on_report=cls._send_report,
+                on_chord=cls._on_chord,
+                on_lost=cls._on_capture_lost,
+                log=print)
+            if not grabber.start():
+                GlobalContext.grab_mode = False
+                return False
 
-    @classmethod
-    def shutdown(cls):
-        """Tell the worker's keyboard loop to exit cleanly.
-
-        Used by the tray's "Exit" menu: flips `active=False` and kicks
-        any running listener.
-        """
-        cls.active = False
-        cls.stop_listener()
-
-    @classmethod
-    def on_press(cls, key):
-        # We intentionally do NOT look at key combinations to toggle
-        # grab mode or shut down — control lives in the tray menu.
-        # Every key we see is passed straight through when grab_mode
-        # is on, EXCEPT Ctrl+V which we hijack to paste the user's
-        # desktop clipboard into the BT peer as simulated keystrokes.
-        # See _do_clipboard_paste for the rationale.
-        if cls._maybe_intercept_paste(key):
-            return
-
-        # Drop real key events while we're synthesising a paste so the
-        # user's keystrokes don't interleave with the typed-out
-        # clipboard. The listener stays alive (we'd lose Ctrl release
-        # tracking otherwise), we just don't forward.
-        if cls.paste_in_progress:
-            return
-
-        pressed_common_key_count = (
-            len(cls.input_key_set) - len(cls.input_modifier_key_set))
-        if pressed_common_key_count >= cls.states_input_key_limit:
-            return
-
-        cls.input_key_set.add(key)
-        if key in cls.modifier_key_bitmasks:
-            cls.input_modifier_key_set.add(key)
-
-        cls.update_states()
-
-        if GlobalContext.grab_mode:
-            GlobalContext.send_data_to_device(bytes(cls.states))
-
-    @classmethod
-    def on_release(cls, key):
-        # Clear the V-consumed latch as soon as the user lifts V, so
-        # the NEXT distinct Ctrl+V press triggers a fresh paste rather
-        # than being suppressed as a stale auto-repeat.
-        if cls.paste_v_consumed:
-            name = cls.parse_key_name(key)
-            if name and name.lower() == 'v':
-                cls.paste_v_consumed = False
-                # The V press never reached input_key_set (we consumed
-                # it in _maybe_intercept_paste), so we don't have a
-                # corresponding press report to undo. Drop the release
-                # silently — the boot-keyboard rollover below would
-                # also no-op, but returning early keeps the wire
-                # quiet.
-                return
-
-        if cls.paste_in_progress:
-            return
-
-        # Boot Keyboard roll-over semantics are "release any key =>
-        # flush the non-modifier slots". That matches what real USB
-        # keyboards report when the host's HID driver is polling.
-        cls.input_key_set.clear()
-        cls.input_modifier_key_set.discard(key)
-
-        cls.update_states()
-
-        if GlobalContext.grab_mode:
-            GlobalContext.send_data_to_device(bytes(cls.states))
-
-    @classmethod
-    def _maybe_intercept_paste(cls, key) -> bool:
-        """If `key` is the V of a Ctrl+V chord and we're in grab mode,
-        kick off a clipboard-to-keystrokes paste and return True.
-        Otherwise return False and let on_press handle the key
-        normally.
-
-        Returns True even when the chord is detected but a paste is
-        already in flight (X11 auto-repeats Ctrl+V while V stays
-        down) — the caller must NOT also forward the key through the
-        normal path in that case.
-        """
-        if not GlobalContext.grab_mode:
-            return False
-        if keyboard is None:
-            # pynput hasn't loaded yet, which means we're not inside a
-            # listener callback — `key` is bogus.
-            return False
-
-        name = cls.parse_key_name(key)
-        if not name or name.lower() != 'v':
-            return False
-
-        ctrl_held = (keyboard.Key.ctrl_l in cls.input_modifier_key_set
-                     or keyboard.Key.ctrl_r in cls.input_modifier_key_set)
-        if not ctrl_held:
-            return False
-
-        if cls.paste_in_progress or cls.paste_v_consumed:
-            # Either we're mid-paste right now, or this is an X11 key
-            # repeat for the V we already consumed. Either way: eat
-            # the event so the chord doesn't slip through to the BT
-            # peer as a stray Ctrl+V.
+            cls._grabber = grabber
+            GlobalContext.grab_mode = True
             return True
 
-        cls.paste_v_consumed = True
-        cls._do_clipboard_paste()
-        return True
+    @classmethod
+    def start_listener(cls) -> bool:
+        """Re-take the grab if grab_mode says it should be held.
+
+        Called when a Bluetooth session comes up, so a grab that was on
+        before a reconnect resumes by itself — the way a real keyboard
+        carries on working after the link blips.
+        """
+        with cls._lock:
+            if not GlobalContext.grab_mode or cls.is_running():
+                return cls.is_running()
+            GlobalContext.grab_mode = False
+            return cls.set_grab_mode(True)
 
     @classmethod
-    def _do_clipboard_paste(cls):
-        """Type the user's desktop clipboard into the BT peer.
+    def stop_listener(cls) -> None:
+        """Release the grab but remember that grab_mode was on.
 
-        Runs synchronously on the listener thread so the user's
-        physical keystrokes can't interleave with the synthesised
-        ones (pynput delivers key events one-at-a-time per listener,
-        so blocking here naturally blocks further on_press / on_release
-        until we return). For a 1k-character paste that's ~8 s of
-        unresponsive keyboard, which matches user expectations: while
-        the clipboard is being typed out, you don't want your own
-        keypresses to go to the iPhone too.
+        Used when the Bluetooth link drops: there is nowhere to forward
+        keystrokes to, so the grab must go, but we want it back when
+        the peer returns. grab_mode stays True for start_listener.
+        """
+        with cls._lock:
+            cls._stop_grab()
+
+    @classmethod
+    def shutdown(cls) -> None:
+        """Release the grab and tell the worker's loop to exit."""
+        cls.active = False
+        with cls._lock:
+            cls._stop_grab()
+            GlobalContext.grab_mode = False
+
+    @classmethod
+    def is_running(cls) -> bool:
+        g = cls._grabber
+        return g is not None and g.is_running()
+
+    @classmethod
+    def _stop_grab(cls) -> None:
+        grabber, cls._grabber = cls._grabber, None
+        if grabber is not None:
+            grabber.stop()
+
+    # ------------------------------- wire -------------------------------
+
+    @classmethod
+    def _send_report(cls, report: bytes) -> None:
+        """Hand one HID input report to the Bluetooth interrupt channel."""
+        GlobalContext.send_data_to_device(report)
+
+    @classmethod
+    def _on_chord(cls, name: str) -> None:
+        if name == 'paste':
+            cls._start_clipboard_paste()
+        elif name == 'panic':
+            cls._on_panic()
+
+    @classmethod
+    def _on_capture_lost(cls) -> None:
+        """Capture stopped without anyone asking (keyboards unplugged).
+
+        Clear grab_mode so the tray stops claiming a grab we no longer
+        hold, and push the correction out. Runs on its own thread for
+        the same reason _on_panic does: it is invoked from the reader
+        thread that _stop_grab would try to join.
+        """
+        def run():
+            print('[kbd] capture ended unexpectedly; clearing grab mode')
+            with cls._lock:
+                cls._stop_grab()
+                GlobalContext.grab_mode = False
+            cb = cls.on_grab_lost
+            if cb is not None:
+                try:
+                    cb(False)
+                except Exception as exc:
+                    print(f'[kbd] on_grab_lost callback failed: {exc}')
+        threading.Thread(target=run, daemon=True,
+                         name='toothkey-kbd-lost').start()
+
+    @classmethod
+    def _on_panic(cls) -> None:
+        """Emergency release triggered from inside the reader loop.
+
+        Runs on a separate thread because it stops the grabber whose
+        own thread invoked us, and stop() joins that thread.
+        """
+        def run():
+            with cls._lock:
+                cls._stop_grab()
+                GlobalContext.grab_mode = False
+            cb = cls.on_grab_lost
+            if cb is not None:
+                try:
+                    cb(False)
+                except Exception as exc:
+                    print(f'[kbd] on_grab_lost callback failed: {exc}')
+        threading.Thread(target=run, daemon=True,
+                         name='toothkey-kbd-panic').start()
+
+    # ------------------------------ paste -------------------------------
+
+    @classmethod
+    def _start_clipboard_paste(cls) -> None:
+        """Begin typing the desktop clipboard into the peer.
+
+        Runs on its own thread with the grabber's forwarding muted, so
+        the reader thread keeps draining real key events — it has to,
+        or the kernel would queue the user's keystrokes and replay them
+        at the peer the moment the paste finished — while none of them
+        reach the wire.
+        """
+        with cls._lock:
+            if cls.paste_in_progress:
+                return
+            grabber = cls._grabber
+            if grabber is None:
+                return
+            cls.paste_in_progress = True
+            grabber.suppress_forwarding = True
+
+        threading.Thread(target=cls._do_clipboard_paste, args=(grabber,),
+                         daemon=True, name='toothkey-kbd-paste').start()
+
+    @classmethod
+    def _do_clipboard_paste(cls, grabber) -> None:
+        """Type the user's desktop clipboard into the BT peer.
 
         Wire sequence per character:
             1. press report  : modifier = (Shift if needed else 0),
                                key[0]   = HID usage id
             2. release report: modifier = 0, all key slots zeroed
-        With the inter-edge delay (`_PASTE_INTERCHAR_DELAY_S`) iOS
-        sees each char as a discrete keypress.
+        With the inter-edge delay (`_PASTE_INTERCHAR_DELAY_S`) iOS sees
+        each char as a discrete keypress.
 
-        Before/after the loop:
-            - Pre-loop: emit a "no modifiers, no keys" report so the
-              Ctrl the user is still physically holding doesn't taint
-              the typed chars on the iPhone side.
-            - Post-loop: rebuild the report from the still-current
-              input_modifier_key_set (Ctrl is most likely still down)
-              so subsequent on_release(Ctrl) sees a coherent state.
+        A quiescent "no modifiers, no keys" report goes out first so the
+        Ctrl the user is still physically holding doesn't combine with
+        the first typed character into an unwanted shortcut, and the
+        real key state is re-asserted at the end.
         """
-        cls.paste_in_progress = True
         try:
             text = _read_desktop_clipboard()
             if not text:
@@ -479,20 +398,17 @@ class ToothkeyKeyboardHandler:
             print(f'[kbd] Ctrl+V intercept: pasting {len(text)} char(s) '
                   f'from desktop clipboard')
 
-            # Step 1: tell the iPhone "no modifiers, no keys" so the
-            # Ctrl the user is still holding doesn't combine with the
-            # first typed char into an unwanted shortcut.
-            quiescent = bytearray(cls.states)
-            quiescent[cls.states_modifier_keys_index] = 0x00
-            for i in range(cls.states_input_key_start_index,
-                           cls.states_size):
-                quiescent[i] = 0x00
-            GlobalContext.send_data_to_device(bytes(quiescent))
+            quiescent = bytes([0xA1, 0x01, 0x00, 0x00,
+                               0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+            GlobalContext.send_data_to_device(quiescent)
             time.sleep(_PASTE_INTERCHAR_DELAY_S)
 
-            # Step 2: type each char as press + release.
             skipped = 0
+            sent = 0
             for ch in text:
+                if not GlobalContext.grab_mode:
+                    print('[kbd] paste aborted: grab released mid-paste')
+                    break
                 mapped = _char_to_hid(ch)
                 if mapped is None:
                     skipped += 1
@@ -500,61 +416,28 @@ class ToothkeyKeyboardHandler:
                 usage, needs_shift = mapped
 
                 press = bytearray(quiescent)
-                press[cls.states_modifier_keys_index] = (
-                    _HID_MOD_SHIFT_L if needs_shift else 0x00)
-                press[cls.states_input_key_start_index] = usage
+                press[2] = _HID_MOD_SHIFT_L if needs_shift else 0x00
+                press[4] = usage
                 GlobalContext.send_data_to_device(bytes(press))
                 time.sleep(_PASTE_INTERCHAR_DELAY_S)
 
-                # Release: zero modifier byte AND zero key slots, so
-                # the next iteration's "press" is unambiguously an
-                # edge transition (iOS treats two identical reports
-                # back-to-back as a single keypress).
-                GlobalContext.send_data_to_device(bytes(quiescent))
+                # Release with the key slots zeroed, so the next press
+                # is unambiguously an edge: iOS collapses two identical
+                # back-to-back reports into a single keypress.
+                GlobalContext.send_data_to_device(quiescent)
                 time.sleep(_PASTE_INTERCHAR_DELAY_S)
+                sent += 1
 
+            msg = f'[kbd] paste: typed {sent} char(s)'
             if skipped:
-                print(f'[kbd] paste: skipped {skipped} unmappable '
-                      f'char(s) (non-ASCII / control codes)')
-
-            # Step 3: re-assert whatever modifiers the user is still
-            # physically holding. on_release for those modifiers will
-            # then see a coherent BT state and can drive it back to
-            # zero normally.
-            cls.update_states()
-            GlobalContext.send_data_to_device(bytes(cls.states))
+                msg += (f', skipped {skipped} unmappable '
+                        f'(non-ASCII / control codes)')
+            print(msg)
+        except Exception as exc:
+            print(f'[kbd] paste failed: {type(exc).__name__}: {exc}')
         finally:
             cls.paste_in_progress = False
-
-    @classmethod
-    def parse_key_name(cls, key):
-        if key is None:
-            return None
-        # pynput must be loaded by now because this runs inside the
-        # listener thread, which was spun up from _run_listener_blocking
-        # after _ensure_pynput_loaded() succeeded.
-        if isinstance(key, keyboard.KeyCode):
-            return key.char
-        if isinstance(key, keyboard.Key):
-            return key.name
-        return None
-
-    @classmethod
-    def update_states(cls):
-        cls.states[cls.states_modifier_keys_index] = 0x00
-        for key in cls.input_modifier_key_set:
-            cls.states[cls.states_modifier_keys_index] |= cls.modifier_key_bitmasks[key]
-
-        index = cls.states_input_key_start_index
-        for key in cls.input_key_set:
-            if key in cls.input_modifier_key_set:
-                continue
-            keyname = cls.parse_key_name(key)
-            hid_usage_id = GlobalContext.convert_key_to_hid_usage_id(
-                keyname.lower() if keyname else keyname)
-            if hid_usage_id is None:
-                continue
-            cls.states[index] = hid_usage_id
-            index += 1
-
-        cls.states[index:] = [0] * (cls.states_size - index)
+            grabber.suppress_forwarding = False
+            # Re-assert whatever the user is still physically holding so
+            # the peer's view matches the real keyboard again.
+            grabber.send_current_state()

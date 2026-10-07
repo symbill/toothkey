@@ -18,7 +18,12 @@ from datetime import datetime
 # live under ./logs/ so they don't clutter the repo root and can be wiped as
 # a single directory. The tray app's "Open log folder" menu item also opens
 # exactly this path.
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+# TOOTHKEY_LOG_DIR redirects every runtime log file somewhere else.
+# Tests set it so that importing worker.py — which installs logging at
+# import time — doesn't append to the live logs, and it's useful for a
+# one-off run you don't want mixed into the real history.
+LOG_DIR = (os.environ.get('TOOTHKEY_LOG_DIR')
+           or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs'))
 LOG_FILE = os.path.join(LOG_DIR, 'toothkey.log')
 
 
@@ -32,10 +37,76 @@ def _ensure_log_dir():
     os.makedirs(LOG_DIR, mode=0o775, exist_ok=True)
 
 
+# Size caps. Nothing here is rotated by logrotate (these files live in
+# the repo, not /var/log), so the writers have to cap themselves or they
+# grow without limit for as long as the service is up.
+MAX_LOG_BYTES = 16 * 1024 * 1024
+LOG_KEEP = 3
+# How much gets written between size checks. A stat() per line would be
+# wasteful; per megabyte is plenty given the cap is measured in tens.
+_ROTATE_CHECK_EVERY_BYTES = 1 * 1024 * 1024
+
+
+def rotate_if_large(path: str, max_bytes: int = MAX_LOG_BYTES,
+                    keep: int = LOG_KEEP) -> bool:
+    """Roll `path` to `path.1` (and .1 to .2, ...) if it exceeds max_bytes.
+
+    Returns True if a rotation happened, so a caller holding the file
+    open knows it must reopen. Never raises: losing a rotation is
+    always preferable to taking down the process that was logging.
+    """
+    try:
+        if os.path.getsize(path) < max_bytes:
+            return False
+    except OSError:
+        return False
+
+    try:
+        oldest = f'{path}.{keep}'
+        if os.path.exists(oldest):
+            os.unlink(oldest)
+        for n in range(keep - 1, 0, -1):
+            src = f'{path}.{n}'
+            if os.path.exists(src):
+                os.replace(src, f'{path}.{n + 1}')
+        os.replace(path, f'{path}.1')
+        return True
+    except OSError:
+        return False
+
+
+def _share_with_log_dir_owner(path: str) -> None:
+    """Make `path` writable by whoever owns the log directory.
+
+    toothkey.log is appended to by both halves of the app: the worker
+    runs as root, the tray as the desktop user. Whichever one creates
+    the file decides its owner, and a root-created file leaves the tray
+    unable to log at all. So after creating it, hand it to the log
+    directory's owner and make it group-writable.
+
+    Only root can give a file away, so this is a no-op (and must be)
+    for the unprivileged tray — root can write to a user-owned file
+    regardless.
+    """
+    if os.geteuid() != 0:
+        return
+    try:
+        st = os.stat(LOG_DIR)
+        os.chown(path, st.st_uid, st.st_gid)
+        os.chmod(path, 0o664)
+    except OSError:
+        pass
+
+
 def _open_log():
     # Unbuffered so everything hits disk immediately, even on crash.
     _ensure_log_dir()
-    return open(LOG_FILE, 'ab', buffering=0)
+    existed = os.path.exists(LOG_FILE)
+    rotated = rotate_if_large(LOG_FILE)
+    fh = open(LOG_FILE, 'ab', buffering=0)
+    if rotated or not existed:
+        _share_with_log_dir_owner(LOG_FILE)
+    return fh
 
 
 def install():
@@ -66,10 +137,12 @@ def install():
     sys.stdout = os.fdopen(1, 'w', buffering=1, encoding='utf-8', errors='replace')
     sys.stderr = os.fdopen(2, 'w', buffering=1, encoding='utf-8', errors='replace')
 
-    log_fh = _open_log()
+    log_fh = _open_log()   # rebound by _reader after a rotation
 
     def _reader():
+        nonlocal log_fh
         buf = b''
+        since_check = 0
         while True:
             try:
                 chunk = os.read(pipe_r, 4096)
@@ -86,6 +159,20 @@ def install():
                     except Exception: pass
                 try: log_fh.write(stamped)
                 except Exception: pass
+                since_check += len(stamped)
+
+            if since_check >= _ROTATE_CHECK_EVERY_BYTES:
+                since_check = 0
+                # We hold the file open, so a rename leaves this handle
+                # pointing at the rotated-away inode. Reopen to land on
+                # the fresh file.
+                if rotate_if_large(LOG_FILE):
+                    try: log_fh.close()
+                    except Exception: pass
+                    try:
+                        log_fh = _open_log()
+                    except Exception:
+                        pass
 
     reader_thread = threading.Thread(target=_reader, daemon=True, name='log-tee')
     reader_thread.start()

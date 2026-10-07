@@ -11,10 +11,8 @@ def run_connection_session():
     """Block until the BT client disconnects.
 
     --cli mode can't toggle grab (that's tray-only), so GlobalContext
-    .grab_mode is essentially fixed-off here and the pynput listener
-    never runs. We just wait on the disconnect event — which is
-    exactly what the worker does too. See worker._run_connection_
-    session for the rationale for not driving pynput from here.
+    .grab_mode stays off here and no keyboard is ever captured. We just
+    wait on the disconnect event — exactly what the worker does too.
     """
     ToothkeyHandler.wait_until_disconnected()
     ToothkeyKeyboardHandler.stop_listener()

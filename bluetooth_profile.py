@@ -180,6 +180,55 @@ class ToothkeyAgent(dbus.service.Object):
 DEFAULT_SERVICE_NAME = 'Toothkey Keyboard'
 
 
+def register_hid_profile_with_bluez(bus, service_name:str = DEFAULT_SERVICE_NAME):
+    """Register our HID SDP record with bluez ProfileManager1.
+
+    Factored out of ToothkeyProfile so the worker can re-register after a
+    bluetoothd restart without constructing a second Profile1 D-Bus object.
+    """
+    manager = dbus.Interface(
+        bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_OBJECT_PATH),
+        PROFILE_MANAGER_INTERFACE,
+    )
+
+    with open(SERVICE_RECORD_FILE) as f:
+        sdp_record = f.read()
+
+    if service_name != DEFAULT_SERVICE_NAME:
+        sdp_record = sdp_record.replace(DEFAULT_SERVICE_NAME, service_name)
+
+    options = dbus.Dictionary({
+        'ServiceRecord': dbus.String(sdp_record),
+        'Role': dbus.String('server'),
+        'RequireAuthentication': dbus.Boolean(True),
+        'RequireAuthorization': dbus.Boolean(False),
+    }, signature='sv')
+
+    try:
+        manager.RegisterProfile(
+            dbus.ObjectPath(BLUEZ_PROFILE_PATH),
+            dbus.String(HID_UUID),
+            options,
+        )
+        print(f'[profile] registered HID profile as "{service_name}"')
+    except Exception as e:
+        print(f'[profile] RegisterProfile failed: {e}')
+        raise
+
+
+def unregister_hid_profile_with_bluez(bus):
+    """Best-effort UnregisterProfile before a bluetoothd restart."""
+    try:
+        manager = dbus.Interface(
+            bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_OBJECT_PATH),
+            PROFILE_MANAGER_INTERFACE,
+        )
+        manager.UnregisterProfile(dbus.ObjectPath(BLUEZ_PROFILE_PATH))
+        print('[profile] unregistered HID profile from bluez')
+    except Exception as e:
+        print(f'[profile] UnregisterProfile skipped: {e}')
+
+
 class ToothkeyProfile(dbus.service.Object):
 
     file_descriptor:int|None = None
@@ -203,64 +252,7 @@ class ToothkeyProfile(dbus.service.Object):
                 'bluez has no Adapter1 object; cannot register HID profile')
 
         super().__init__(bus, BLUEZ_PROFILE_PATH)
-
-        manager = dbus.Interface(
-            bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_OBJECT_PATH),
-            PROFILE_MANAGER_INTERFACE
-        )
-
-        with open(SERVICE_RECORD_FILE) as f:
-            sdp_record = f.read()
-
-        if service_name != DEFAULT_SERVICE_NAME:
-            sdp_record = sdp_record.replace(DEFAULT_SERVICE_NAME, service_name)
-
-        # HID channels MUST be authenticated + encrypted on iOS. Setting
-        # RequireAuthentication=True tells bluez to advertise the profile
-        # accordingly and to co-operate with the kernel when it triggers
-        # SSP on our incoming L2CAP sockets (we additionally set
-        # BT_SECURITY on those sockets in bluetooth_handler.py).
-        #
-        # Wrap each value in an explicit dbus type and the dict itself in
-        # dbus.Dictionary(signature='sv'). Without explicit types, python-dbus
-        # tries to introspect ProfileManager1.RegisterProfile to discover the
-        # `a{sv}` signature; if that introspection ever fails (e.g. bluez in
-        # a half-up state), we hit
-        #   TypeError: Expected a string or unicode object
-        # at message-append time, which masks the real problem. Explicit
-        # types make the call work regardless of introspection state.
-        options = dbus.Dictionary({
-            'ServiceRecord': dbus.String(sdp_record),
-            'Role': dbus.String('server'),
-            'RequireAuthentication': dbus.Boolean(True),
-            'RequireAuthorization': dbus.Boolean(False),
-        }, signature='sv')
-
-        # Same belt-and-suspenders treatment for the positional args.
-        # RegisterProfile's real signature is `osa{sv}` — the first arg is
-        # an *object path* (`o`), not a string. Normally python-dbus
-        # introspects ProfileManager1 and learns to marshal a Python str
-        # as `o` here, but on a freshly-booted system bluez can be in a
-        # half-up state where introspection returns nothing. python-dbus
-        # then falls back to inferring types from the Python objects, a
-        # `str` becomes `s`, and the call goes out as `ssa{sv}` — which
-        # bluez rejects with
-        #   org.freedesktop.DBus.Error.UnknownMethod: Method "RegisterProfile"
-        #   with signature "ssa{sv}" on interface "org.bluez.ProfileManager1"
-        #   doesn't exist
-        # Wrapping the path in dbus.ObjectPath (and the UUID in dbus.String
-        # for symmetry) makes the call survive whatever introspection state
-        # bluez happens to be in at boot.
-        try:
-            manager.RegisterProfile(
-                dbus.ObjectPath(BLUEZ_PROFILE_PATH),
-                dbus.String(HID_UUID),
-                options,
-            )
-            print(f'[profile] registered HID profile as "{service_name}"')
-        except Exception as e:
-            print(f'[profile] RegisterProfile failed: {e}')
-            raise
+        register_hid_profile_with_bluez(bus, service_name)
 
     @dbus.service.method(PROFILE_INTERFACE, in_signature='', out_signature='')
     def Release(self):

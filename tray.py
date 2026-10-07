@@ -4,7 +4,7 @@ Process topology (both processes are started by start.sh as direct
 siblings — neither spawns the other):
 
     user's shell
-      ├─ sudo python3 worker.py --socket <UDS>       (root; BT + HID + pynput)
+      ├─ sudo python3 worker.py --socket <UDS>  (root; BT + HID + capture)
       └─ python3 tray.py --socket <UDS>              (user; this file)
 
 Why split?
@@ -66,6 +66,36 @@ try:
     os.makedirs(os.path.dirname(_TRAY_DIAG_PATH), mode=0o775, exist_ok=True)
 except Exception:
     pass
+
+# Size cap for this file. It is append-only across every run and
+# nothing else rotates it, so without a cap it grows for as long as the
+# service keeps restarting — in practice to hundreds of megabytes.
+# Deliberately implemented inline rather than reusing
+# logging_setup.rotate_if_large: this whole block exists to diagnose
+# failures in the imports below it, so it must not depend on them.
+_DIAG_MAX_BYTES = 16 * 1024 * 1024
+_DIAG_KEEP = 2
+_tdiag_written = 0
+
+
+def _diag_rotate(path):
+    """Roll `path` to .1/.2 if it has grown past the cap. Never raises."""
+    try:
+        if os.path.getsize(path) < _DIAG_MAX_BYTES:
+            return False
+        oldest = f'{path}.{_DIAG_KEEP}'
+        if os.path.exists(oldest):
+            os.unlink(oldest)
+        for n in range(_DIAG_KEEP - 1, 0, -1):
+            src = f'{path}.{n}'
+            if os.path.exists(src):
+                os.replace(src, f'{path}.{n + 1}')
+        os.replace(path, f'{path}.1')
+        return True
+    except Exception:
+        return False
+
+_diag_rotate(_TRAY_DIAG_PATH)
 try:
     _tray_diag = open(_TRAY_DIAG_PATH, 'ab', buffering=0)
 except Exception:
@@ -74,12 +104,21 @@ except Exception:
 def _diag(msg: str) -> None:
     """Write one timestamped line to tray-diag.log. Unbuffered, bypasses
     logging_setup. Must not raise."""
+    global _tray_diag, _tdiag_written
     if _tray_diag is None:
         return
     try:
         from datetime import datetime as _dt
         ts = _dt.now().astimezone().isoformat(timespec='milliseconds')
-        _tray_diag.write(f'{ts} [tray-diag pid={os.getpid()}] {msg}\n'.encode('utf-8', 'replace'))
+        line = f'{ts} [tray-diag pid={os.getpid()}] {msg}\n'.encode('utf-8', 'replace')
+        _tray_diag.write(line)
+        _tdiag_written += len(line)
+        if _tdiag_written >= 1024 * 1024:
+            _tdiag_written = 0
+            if _diag_rotate(_TRAY_DIAG_PATH):
+                try: _tray_diag.close()
+                except Exception: pass
+                _tray_diag = open(_TRAY_DIAG_PATH, 'ab', buffering=0)
     except Exception:
         pass
 
@@ -136,6 +175,7 @@ from PyQt5.QtWidgets import (
 )
 _diag('PyQt5 imports ok')
 
+import x11_window_hints
 from logging_setup import LOG_DIR
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -170,6 +210,28 @@ PAUSE_BAR_GAP_FRAC = 0.10     # gap between the two bars
 # ---------------------------------------------------------------------------
 # icon building
 # ---------------------------------------------------------------------------
+
+def _keep_off_taskbar(widget) -> None:
+    """Keep a floating status window out of the taskbar and pager.
+
+    Qt has no flag for this and the window type doesn't imply it on
+    KWin 6, so it goes through x11_window_hints. Call it on both sides
+    of show(): before, so the state is in place when the window manager
+    maps the window, and after, so an already-managed window gets the
+    client message it actually acts on.
+
+    Only meaningful on xcb. Silent on anything else — there is nothing
+    to set, and a missing taskbar hint is not worth a log line per
+    toast.
+    """
+    app = QApplication.instance()
+    if app is None or app.platformName() != 'xcb':
+        return
+    try:
+        x11_window_hints.skip_taskbar_and_pager(int(widget.winId()))
+    except Exception as exc:
+        _diag(f'[hints] skip-taskbar failed: {type(exc).__name__}: {exc}')
+
 
 def _render_svg_pixmap(renderer: QSvgRenderer, size: int) -> QPixmap:
     pm = QPixmap(size, size)
@@ -360,9 +422,12 @@ class GrabIndicator(QWidget):
     clicked = pyqtSignal()
 
     def __init__(self, tooth_pixmap: QPixmap, parent: QObject = None):
-        # Qt.Tool keeps it off the taskbar; Qt.FramelessWindowHint removes
-        # the window chrome; Qt.WindowStaysOnTopHint keeps it above other
-        # windows; Qt.WA_TranslucentBackground lets us paint with alpha.
+        # Qt.FramelessWindowHint removes the window chrome;
+        # Qt.WindowStaysOnTopHint keeps it above other windows;
+        # Qt.WA_TranslucentBackground lets us paint with alpha. Qt.Tool
+        # makes it a utility window rather than a second application
+        # window — but note that does NOT keep it out of the taskbar on
+        # KWin, which is what _keep_off_taskbar is for.
         super().__init__(
             None,
             Qt.Tool
@@ -393,6 +458,18 @@ class GrabIndicator(QWidget):
         self._pulse_timer.timeout.connect(self._on_pulse_tick)
         self._pulse_start_ms = 0
 
+        # Stay anchored to the corner when the screen it is anchored to
+        # changes shape: a resolution switch, a monitor being plugged
+        # in, or the panel being resized all move the top-right corner.
+        app = QApplication.instance()
+        if app is not None:
+            screen = app.primaryScreen()
+            if screen is not None:
+                screen.availableGeometryChanged.connect(
+                    self._on_screen_changed)
+                screen.geometryChanged.connect(self._on_screen_changed)
+            app.primaryScreenChanged.connect(self._on_screen_changed)
+
     # ------------------------- public API --------------------------
 
     def show_pending(self) -> None:
@@ -402,10 +479,7 @@ class GrabIndicator(QWidget):
         self._pulse_start_ms = int(time.monotonic() * 1000)
         if not self._pulse_timer.isActive():
             self._pulse_timer.start()
-        self._position_top_right()
-        if not self.isVisible():
-            self.show()
-        self.raise_()
+        self._show_at_top_right()
         self.update()
 
     def show_active(self) -> None:
@@ -415,11 +489,21 @@ class GrabIndicator(QWidget):
         if self._pulse_timer.isActive():
             self._pulse_timer.stop()
         self._opacity = GRAB_PULSE_MAX_OPACITY
+        self._show_at_top_right()
+        self.update()
+
+    def _show_at_top_right(self) -> None:
+        """Show (if hidden), place, raise, then check it took."""
         self._position_top_right()
         if not self.isVisible():
+            _keep_off_taskbar(self)
             self.show()
+            _keep_off_taskbar(self)
+        # A freshly mapped window may have been placed by the WM, so
+        # re-apply now that a QWindow exists to move.
+        self._position_top_right()
         self.raise_()
-        self.update()
+        self._verify_position()
 
     def hide_indicator(self) -> None:
         """Hide the widget and stop animating."""
@@ -431,20 +515,68 @@ class GrabIndicator(QWidget):
 
     # ------------------------- internals ---------------------------
 
-    def _position_top_right(self) -> None:
+    def _target_top_right(self):
+        """Where the indicator belongs, or None if we can't tell yet."""
         app = QApplication.instance()
         if app is None:
-            return
+            return None
         screen = app.primaryScreen()
         if screen is None:
-            return
+            return None
         # availableGeometry excludes panels / taskbars where Qt can
         # detect them (works on KDE / GNOME); falls back to the full
         # screen rect otherwise.
         rect = screen.availableGeometry()
-        x = rect.right() - self.width() - GRAB_INDICATOR_MARGIN
-        y = rect.top() + GRAB_INDICATOR_MARGIN
+        return (rect.right() - self.width() - GRAB_INDICATOR_MARGIN,
+                rect.top() + GRAB_INDICATOR_MARGIN)
+
+    def _position_top_right(self) -> None:
+        """Move to the top-right corner of the primary screen.
+
+        Called before every show() and again just after, because a
+        window manager is free to place a window on map and only
+        honours a move once the window exists. Both paths are needed:
+        move() sets the position Qt will request at map time, and the
+        QWindow setPosition afterwards corrects it if the WM placed it
+        somewhere else.
+        """
+        target = self._target_top_right()
+        if target is None:
+            return
+        x, y = target
         self.move(x, y)
+        if self.isVisible():
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.setPosition(x, y)
+
+    def _verify_position(self) -> None:
+        """Log whether the indicator actually landed where we asked.
+
+        Placement is silently ignored on platforms that don't let a
+        client position its own windows, which otherwise looks like
+        the indicator simply appearing in the wrong place for no
+        reason. Saying so in the log turns that into one grep.
+        """
+        target = self._target_top_right()
+        if target is None:
+            return
+        x, y = target
+        got = self.geometry()
+        if abs(got.x() - x) <= 1 and abs(got.y() - y) <= 1:
+            _diag(f'[indicator] placed at {got.x()},{got.y()} (top-right)')
+            return
+        app = QApplication.instance()
+        platform = app.platformName() if app is not None else '?'
+        msg = (f'[indicator] placement ignored: asked for {x},{y}, '
+               f'got {got.x()},{got.y()} (Qt platform {platform!r})')
+        _diag(msg)
+        print(f'[tray] WARNING: {msg}')
+
+    def _on_screen_changed(self, *_args) -> None:
+        """Re-anchor after a resolution change or panel resize."""
+        if self.isVisible():
+            self._position_top_right()
 
     def _on_pulse_tick(self) -> None:
         # Sinusoidal opacity in [MIN, MAX] with period PULSE_PERIOD_MS.
@@ -531,29 +663,19 @@ class Toast(QWidget):
     _BORDER_RADIUS = 10
 
     def __init__(self, parent: QObject = None):
-        # Window-type choice has a tricky history here:
+        # Qt.Dialog, rather than one of the window types that sound
+        # more apt for a toast: it is the one that is reliably mapped
+        # AND positionable. Qt.Tool and Qt.SplashScreen both have
+        # failure modes here — a splash gets auto-placed by the window
+        # manager, and a frameless tool with WindowStaysOnTopHint can
+        # end up present but never mapped.
         #
-        #   Qt.Tool / Qt.SplashScreen: reliably skipped from the
-        #     taskbar, BUT have failure modes on both X11 and
-        #     Wayland — on Plasma Wayland kwin ignores client-
-        #     driven move() and auto-places them (top-right); on
-        #     X11 + KDE we've also seen the surface go fully
-        #     invisible (frameless + tool with WS_OnTop produces
-        #     a present-but-unmapped window in some kwin builds).
-        #
-        #   Qt.Dialog: reliably mapped AND positioning works on
-        #     both display servers — but on KDE/Plasma X11 it
-        #     also gets a (transient) taskbar entry while visible.
-        #
-        # Solution: stay on Qt.Dialog for visibility + positioning
-        # reliability, then override the X11 _NET_WM_WINDOW_TYPE
-        # hint to NOTIFICATION via WA_X11NetWmWindowTypeNotification.
-        # KWin's taskbar manager skips windows whose first NET-WM
-        # type is NOTIFICATION, so the entry disappears, but Qt
-        # still treats us as a Dialog internally so positioning
-        # and mapping stay correct. The attribute is a no-op on
-        # Wayland (no _NET_WM_WINDOW_TYPE there), so the existing
-        # Wayland behaviour is unchanged.
+        # A dialog does come with a taskbar button, which a 2-second
+        # toast has no business having. The window type does not fix
+        # that: KWin 6 reports skipTaskbar=false for
+        # _NET_WM_WINDOW_TYPE_NOTIFICATION just as it does for a
+        # utility window. What fixes it is the _NET_WM_STATE_SKIP_TASKBAR
+        # state, which show_message() sets via _keep_off_taskbar().
         super().__init__(
             None,
             Qt.Dialog
@@ -563,9 +685,10 @@ class Toast(QWidget):
         self.setWindowModality(Qt.NonModal)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_AlwaysStackOnTop, True)
-        # X11-only: identifies the surface as a notification to
-        # the WM. KWin uses this to skip the taskbar entry while
-        # leaving stacking / positioning untouched.
+        # X11-only: tells the window manager what kind of surface
+        # this is, which is what it should be regardless. It does not
+        # by itself keep the toast off the taskbar on KWin 6 — see
+        # _keep_off_taskbar() for the part that does.
         try:
             self.setAttribute(Qt.WA_X11NetWmWindowTypeNotification, True)
         except AttributeError:
@@ -630,7 +753,9 @@ class Toast(QWidget):
             self.hide()
             QApplication.processEvents()
 
+        _keep_off_taskbar(self)
         self.show()
+        _keep_off_taskbar(self)
         self.raise_()
         self.update()
         QApplication.processEvents()
@@ -817,12 +942,36 @@ class WorkerLink(QObject):
 
     # --------------------------- startup ---------------------------
 
-    def start(self, connect_timeout: float = 10.0) -> None:
-        """Poll-connect to the worker's UDS until it accepts or we
-        hit `connect_timeout`. start.sh is expected to have already
-        waited for the socket file to appear, so this is mostly a
-        safety net for the "accept still not ready" race window.
+    def close(self) -> None:
+        """Drop any current connection so start() can be called again.
+
+        The worker outlives the tray, so a tray reconnects over the
+        life of one worker: after the worker is restarted, and after
+        any blip that gave us EOF. Each attempt needs a fresh socket.
         """
+        with self._send_lock:
+            self._wfh = None
+        for fh in (self._conn,):
+            if fh is None:
+                continue
+            try:
+                fh.close()
+            except OSError:
+                pass
+        self._conn = None
+        self._worker_pid = None
+
+    def start(self, connect_timeout: float = 2.0) -> None:
+        """Poll-connect to the worker's UDS until it accepts or we
+        hit `connect_timeout`.
+
+        Raises on failure; the caller retries. The timeout is short
+        because being unable to connect right now is normal — the
+        worker may be mid-restart — and Tray._schedule_relink turns
+        that into a patient background retry rather than one long
+        blocking wait.
+        """
+        self.close()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         deadline = time.monotonic() + connect_timeout
         last_err = None
@@ -834,6 +983,10 @@ class WorkerLink(QObject):
                 last_err = e
                 time.sleep(0.1)
         else:
+            try:
+                sock.close()
+            except OSError:
+                pass
             raise RuntimeError(
                 f'worker not reachable at {self._sock_path}: {last_err}')
 
@@ -848,9 +1001,9 @@ class WorkerLink(QObject):
         print(f'[tray] connected to worker at {self._sock_path}')
 
         # Hand the worker the graphical-session env vars it needs to
-        # lazy-import pynput for keyboard grab. When the worker is
-        # started by systemd at boot it has no DISPLAY / WAYLAND_DISPLAY
-        # / XAUTHORITY / XDG_RUNTIME_DIR, because those belong to the
+        # read our clipboard for Ctrl+V. When the worker is started by
+        # systemd at boot it has no DISPLAY / WAYLAND_DISPLAY /
+        # XAUTHORITY / XDG_RUNTIME_DIR, because those belong to the
         # per-user graphical session, not to the system. The tray runs
         # inside that session, so it forwards them here on connect.
         env = {}
@@ -921,6 +1074,13 @@ class WorkerLink(QObject):
 
 class Tray(QObject):
 
+    # Reconnect backoff: prompt at first, then settling to one attempt
+    # every few seconds. Retrying forever is deliberate — the tray is
+    # useless without the worker, and the user shouldn't have to
+    # restart anything to recover from a worker restart.
+    _RELINK_DELAY_MIN_MS = 500
+    _RELINK_DELAY_MAX_MS = 5000
+
     def __init__(self, app: QApplication, sock_path: str):
         super().__init__()
         self.app = app
@@ -955,6 +1115,12 @@ class Tray(QObject):
 
         # Transient confirmation toast — shown on grab enable.
         self.toast = Toast()
+
+        # Reconnect bookkeeping. The worker outlives the tray, so the
+        # tray has to be able to dial back in — at boot before the
+        # worker is up, and after any worker restart.
+        self._relink_attempts = 0
+        self._relink_delay_ms = self._RELINK_DELAY_MIN_MS
 
         self.link = WorkerLink(sock_path, self)
         self.link.state_changed.connect(self._on_state_changed)
@@ -1126,13 +1292,49 @@ class Tray(QObject):
     # ------------------------- link plumbing -----------------------
 
     def _start_link(self):
+        """Connect to the worker, retrying in the background forever.
+
+        Not being able to connect is a normal, temporary condition: the
+        worker may be starting at boot before the graphical session, or
+        mid-restart. Giving up after one try is what leaves the tray
+        showing a red X and "worker unreachable" while a perfectly
+        healthy worker keeps the iPhone paired.
+        """
+        if self._shutting_down:
+            return
         try:
             self.link.start()
         except Exception as e:
-            print(f'[tray] failed to reach worker: {type(e).__name__}: {e}')
-            self.tray.setToolTip(f'Tooth-key: worker unreachable ({e})')
-            self.tray.showMessage('Tooth-key', f'Worker unreachable: {e}',
-                                  QSystemTrayIcon.Critical, 8000)
+            self._relink_attempts += 1
+            # One notification, on the first failure. After that the
+            # tooltip carries the state; a popup per retry would be
+            # worse than the problem.
+            if self._relink_attempts == 1:
+                print(f'[tray] failed to reach worker: '
+                      f'{type(e).__name__}: {e}')
+                self.tray.showMessage(
+                    'Tooth-key',
+                    f'Worker unreachable, retrying: {e}',
+                    QSystemTrayIcon.Warning, 5000)
+            self.tray.setIcon(self.icon_disconnected)
+            self.tray.setToolTip(
+                f'Tooth-key: waiting for the worker '
+                f'(attempt {self._relink_attempts})')
+            self._schedule_relink()
+            return
+
+        self._relink_attempts = 0
+        self._relink_delay_ms = self._RELINK_DELAY_MIN_MS
+
+    def _schedule_relink(self):
+        """Try again later, backing off to a slow steady retry."""
+        if self._shutting_down:
+            return
+        delay = self._relink_delay_ms
+        self._relink_delay_ms = min(delay * 2, self._RELINK_DELAY_MAX_MS)
+        _diag(f'relink: retrying in {delay}ms '
+              f'(attempt {self._relink_attempts})')
+        QTimer.singleShot(delay, self._start_link)
 
     def _on_state_changed(self, msg: dict):
         # Filter out the "type" key so _state has the same shape
@@ -1154,12 +1356,24 @@ class Tray(QObject):
         # Do this BEFORE _refresh_ui_from_state so the tray icon /
         # menu update and indicator update land on the same Qt tick.
         grab = bool(self._state.get('grab'))
+        was_pending = self._grab_pending
+        self._grab_pending = False
         if grab:
-            self._grab_pending = False
             self.indicator.show_active()
+            if was_pending:
+                # Confirmed: the worker holds the grab. Safe to say so.
+                self.toast.show_message(
+                    'Keyboard grabbed. Click '
+                    '<b>Tooth-key</b> to ungrab.')
         else:
-            self._grab_pending = False
             self.indicator.hide_indicator()
+            if was_pending:
+                # We asked for a grab and the worker came back without
+                # one. Say that plainly and point at the log.
+                print('[tray] grab request was refused by the worker')
+                self.toast.show_message(
+                    'Could not grab the keyboard. '
+                    'See <b>Open log folder</b>.', duration_ms=4000)
 
         self._refresh_ui_from_state()
 
@@ -1169,20 +1383,24 @@ class Tray(QObject):
             # Expected path — Exit was clicked, finish quitting.
             self._quit_now()
             return
-        # Unexpected: worker died on its own. Flip the icon to a clear
-        # "broken" state and notify. We don't auto-respawn — restart
-        # by the user via ./start.sh is the intended recovery.
+        # Unexpected: the worker exited, was restarted under us, or
+        # the link blipped. Show it as disconnected and start dialling
+        # again — the worker keeps its listening socket open for its
+        # whole life, so a reconnect is the normal recovery and needs
+        # no intervention.
         self._state = {'connected': False, 'name': None, 'mac': None,
                        'grab': False, 'paused': False}
         self._grab_pending = False
         self.indicator.hide_indicator()
         self.tray.setIcon(self.icon_disconnected)
-        self.tray.setToolTip('Tooth-key: worker died — re-run ./start.sh')
-        self.tray.showMessage(
-            'Tooth-key', 'Worker process exited unexpectedly. '
-                         'Quit the tray and re-run ./start.sh.',
-            QSystemTrayIcon.Critical, 8000)
+        self.tray.setToolTip('Tooth-key: reconnecting to the worker...')
         self._rebuild_menu()
+        self.link.close()
+        # Reset the backoff: this is a fresh outage, not a continuation
+        # of an earlier one, so the first retry should be prompt.
+        self._relink_attempts = 0
+        self._relink_delay_ms = self._RELINK_DELAY_MIN_MS
+        self._schedule_relink()
 
     def _on_shutdown_ack(self):
         # Worker confirmed the shutdown request; the subsequent EOF on
@@ -1241,21 +1459,18 @@ class Tray(QObject):
 
         # Show the floating indicator *immediately* in pending/pulsing
         # mode. The worker's state broadcast (via _on_state_changed)
-        # will promote it to solid once the pynput listener is actually
-        # up and grabbing. If the user is turning grab OFF, hide now —
+        # will promote it to solid once the worker is actually
+        # grabbing. If the user is turning grab OFF, hide now —
         # we also get an authoritative grab=False state update shortly
         # but hiding optimistically keeps the UI snappy.
         if new_state:
             self._grab_pending = True
             self.indicator.show_pending()
-            # Brief on-screen confirmation so the user knows the grab
-            # actually took hold. Matches the wording of the tray
-            # tooltip's "Click to ungrab" so the mental model stays
-            # consistent.
-            self.toast.show_message(
-                'Keyboard grabbed. Click '
-                '<b>Tooth-key</b> to ungrab.'
-            )
+            # No toast yet. The worker may refuse the grab (no keyboard
+            # it can open, another process holding an exclusive grab),
+            # and a toast saying "grabbed" over a keyboard that isn't
+            # captured is worse than no toast at all. _on_state_changed
+            # shows it once the worker confirms.
         else:
             self._grab_pending = False
             self.indicator.hide_indicator()
@@ -1500,6 +1715,36 @@ def main():
               'Launch this from a graphical session.', file=sys.stderr)
         return 2
 
+    # Pick the Qt platform before QApplication reads it.
+    #
+    # The floating grab indicator has three hard requirements: it sits
+    # at a chosen screen position, it stays above other windows, and it
+    # never appears in the taskbar. Wayland's xdg-shell deliberately
+    # offers a client none of those — window placement is the
+    # compositor's business, there is no protocol for "keep above", and
+    # a parentless Qt.Tool is just another toplevel. Under xcb all
+    # three work: Qt maps the window as _NET_WM_WINDOW_TYPE_UTILITY
+    # with _NET_WM_STATE_ABOVE and KWin honours the position.
+    #
+    # Nothing else in the tray needs Wayland (the tray icon itself is
+    # the StatusNotifierItem D-Bus protocol, which is display-server
+    # agnostic), so xcb is the better platform for this process whole.
+    # Set TOOTHKEY_QT_PLATFORM to override.
+    forced = os.environ.get('TOOTHKEY_QT_PLATFORM')
+    if forced:
+        os.environ['QT_QPA_PLATFORM'] = forced
+        _diag(f'main: QT_QPA_PLATFORM forced to {forced!r} by '
+              f'TOOTHKEY_QT_PLATFORM')
+    elif os.environ.get('QT_QPA_PLATFORM'):
+        _diag('main: QT_QPA_PLATFORM already set to '
+              f'{os.environ["QT_QPA_PLATFORM"]!r}; leaving it alone')
+    elif os.environ.get('DISPLAY'):
+        os.environ['QT_QPA_PLATFORM'] = 'xcb'
+        _diag('main: selecting xcb (X11/XWayland) for window placement')
+    else:
+        _diag('main: no DISPLAY; leaving platform selection to Qt. '
+              'The floating grab indicator will not be positionable.')
+
     _diag('main: creating QApplication')
     try:
         app = QApplication([sys.argv[0]] + qt_args)
@@ -1507,15 +1752,23 @@ def main():
         _diag(f'main: QApplication() raised: {type(e).__name__}: {e}')
         raise
     _diag('main: QApplication created')
+    platform = app.platformName()
+    _diag(f'main: platformName={platform!r}')
+    print(f'[tray] Qt platform: {platform}')
+    if platform != 'xcb':
+        print(f'[tray] WARNING: Qt platform is {platform!r}, not xcb. The '
+              f'floating grab indicator cannot be placed, kept above '
+              f'other windows, or kept out of the taskbar on this '
+              f'platform. Install the X11 platform plugin, or run an '
+              f'X11 session, if the indicator misbehaves.')
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName('Tooth-key')
     app.setDesktopFileName('toothkey')
 
-    # Grant the root worker access to our X server so pynput (running
-    # as root) can open a display. Ignored on Wayland and harmless
-    # otherwise. Run quietly — if xhost is missing or this is Wayland
-    # we just skip it; grab will still work on Wayland via the pynput
-    # Wayland backends (evdev / libinput).
+    # Let the root worker open our X display. Keyboard capture no
+    # longer needs it (the worker reads /dev/input directly), but
+    # xclip — the X11 half of the Ctrl+V clipboard read — still does.
+    # Harmless and quiet when xhost is missing or this is Wayland.
     try:
         subprocess.run(['xhost', '+SI:localuser:root'],
                        stdout=subprocess.DEVNULL,
