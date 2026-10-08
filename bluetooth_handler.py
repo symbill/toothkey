@@ -239,13 +239,12 @@ _FORBIDDEN_ADAPTER_UUID_SHORTS = frozenset({
 # LimitedDiscoverable (0x001) is benign when the adapter is discoverable.
 _COD_SERVICE_BITS_BENIGN = 0x001
 
-# Which process puts each forbidden UUID on the adapter. Knowing the
-# owner is what makes the difference between a fixable problem and one
-# to leave alone: obexd we stop (transiently — see quiet_obex_daemons),
-# whereas the audio and telephony UUIDs are registered over D-Bus by
-# PipeWire/WirePlumber, which bluetoothd's own `-P` plugin blocklist
-# cannot prevent and which we must not disable — that is the user's
-# Bluetooth audio.
+# Which process puts each forbidden UUID on the adapter. Both are
+# registered over D-Bus, so bluetoothd's own `-P` plugin blocklist
+# cannot prevent either: obexd we stop transiently (see
+# quiet_obex_daemons), and the audio/telephony records come from
+# PipeWire/WirePlumber, which is configured not to offer the headset
+# roles (see the drop-in that start.sh documents).
 _UUID_OWNERS = {
     '0x1105': 'obexd', '0x1106': 'obexd',
     '0x1130': 'obexd', '0x1132': 'obexd', '0x1133': 'obexd',
@@ -254,6 +253,86 @@ _UUID_OWNERS = {
     '0x110c': 'PipeWire', '0x110e': 'PipeWire', '0x110f': 'PipeWire',
     '0x1112': 'PipeWire', '0x111e': 'PipeWire', '0x111f': 'PipeWire',
 }
+
+
+# The headset/gateway records, which are the dangerous ones. While any
+# of these is on the adapter, a bonded phone can route a call here: the
+# machine is advertising itself as something you can talk through.
+#
+#   0x1108 Headset            0x1112 Headset Audio Gateway
+#   0x111e Handsfree          0x111f Handsfree Audio Gateway
+#
+# This is not theoretical. On 2026-10-08 a live call went silent as
+# this box attached to the phone as a Hands-Free unit, pulled in by
+# BlueZ's policy plugin the moment toothkey's paging brought the link
+# up. The A2DP records (0x110a/0x110b and the AVRCP pair) are a
+# different matter — they can carry music, not calls — so they are
+# noted but not treated as a hazard.
+_CALL_AUDIO_UUID_SHORTS = frozenset({'0x1108', '0x1112', '0x111e', '0x111f'})
+
+
+BLUEZ_MAIN_CONF = '/etc/bluetooth/main.conf'
+
+
+def _reconnect_uuids_setting(conf_path:str = None) -> str | None:
+    """The active `ReconnectUUIDs` from BlueZ main.conf.
+
+    Returns the raw value, '' when explicitly empty, or None when the
+    setting is absent or commented out — which means BlueZ falls back
+    to its built-in default of Headset AG, Handsfree AG and both A2DP
+    UUIDs, i.e. precisely what a phone advertises.
+    """
+    try:
+        with open(conf_path or BLUEZ_MAIN_CONF, encoding='utf-8') as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    continue
+                if stripped.replace(' ', '').startswith('ReconnectUUIDs='):
+                    return stripped.split('=', 1)[1].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _check_call_audio_hijack_risk(adapter_uuid_shorts,
+                                  conf_path:str = None) -> list[str]:
+    """Report any way this machine could steal the phone's call audio.
+
+    Two conditions, either of which is enough to be worth saying out
+    loud, because the failure is silent from here: the phone simply
+    moves the call to this computer mid-sentence and the person on the
+    other end stops being audible.
+
+      - the adapter advertises a headset or audio-gateway record, so
+        the phone can see us as somewhere to put a call; or
+      - BlueZ's ReconnectUUIDs is at its default, so the policy plugin
+        connects audio profiles on its own every time our paging
+        brings a bonded phone's link up.
+
+    Returns a list of human-readable problems, empty when clear.
+    """
+    problems = []
+
+    offered = sorted(set(adapter_uuid_shorts) & _CALL_AUDIO_UUID_SHORTS)
+    if offered:
+        tagged = ', '.join(f'{u} ({_UUID_TAGS.get(u, "?")})' for u in offered)
+        problems.append(
+            f'adapter offers call-audio services: {tagged} — a bonded '
+            f'phone can route a call to this machine')
+
+    reconnect = _reconnect_uuids_setting(conf_path)
+    if reconnect is None:
+        problems.append(
+            "main.conf has no explicit 'ReconnectUUIDs=', so BlueZ uses "
+            'its default (Headset AG, Handsfree AG, A2DP) and its policy '
+            'plugin will connect a bonded phone\'s audio by itself')
+    elif reconnect:
+        problems.append(
+            f"main.conf sets 'ReconnectUUIDs={reconnect}', so BlueZ's "
+            f'policy plugin reconnects those services to a bonded phone')
+
+    return problems
 
 
 def _attribute_pollution(reasons:list[str]) -> str:
@@ -788,17 +867,27 @@ class ToothkeyHandler:
                 post_pollution = _adapter_pollution_reasons(bus, adapter_path)
 
             if post_pollution:
-                # Not necessarily a fault. The CoD major/minor still say
-                # Peripheral/Keyboard, and iOS has been observed binding
-                # HID with these extra service bits set. The thing that
-                # decides it is whether the peer sends a substantive HID
-                # transaction once connected, which the phantom-session
-                # watchdog reports as "engaged HID".
-                print('[adapter] leaving the above in place: CoD major/minor '
-                      'are still Peripheral/Keyboard, which is what iOS '
-                      'matches on. If iOS does refuse HID, the log line to '
-                      'look for is "phantom-watch"; `./start.sh '
-                      '--reset-bluez` is the bigger hammer.')
+                # Whether HID still binds is NOT the measure of whether
+                # this matters. Extra service bits do leave the CoD's
+                # major/minor reading Peripheral/Keyboard, and iOS has
+                # been observed pairing happily through them — but an
+                # adapter that advertises call-audio services can have a
+                # phone move a live call onto this machine, which says
+                # nothing about the keyboard working. Hence the separate
+                # hazard check below rather than one "polluted" verdict.
+                print('[adapter] the records above do not stop HID: CoD '
+                      'major/minor still read Peripheral/Keyboard, which '
+                      'is what iOS matches on. `./start.sh --reset-bluez` '
+                      'is the bigger hammer if pairing does start failing.')
+
+        # Call-audio hijack check. Deliberately separate from the
+        # pollution report: that one asks "will iOS still pair", this
+        # one asks "can the phone put a call through this machine",
+        # and the second question has a far worse failure mode — it
+        # takes a call away mid-sentence with no sign at this end.
+        for problem in _check_call_audio_hijack_risk(
+                cls._adapter_uuid_shorts(bus, adapter_path)):
+            print(f'[adapter] CALL-AUDIO RISK: {problem}')
 
         _bdiag('init: _log_bluetoothd_cmdline')
         cls._log_bluetoothd_cmdline()
@@ -2339,6 +2428,24 @@ class ToothkeyHandler:
     _pair_attempts:dict = {}
     _PAIR_RETRY_INTERVAL_S:float = 30.0
     _PAIR_MAX_ATTEMPTS_PER_PEER:int = 5
+
+    @classmethod
+    def _adapter_uuid_shorts(cls, bus:SystemBus, adapter_path:str) -> list:
+        """The adapter's advertised UUIDs as '0xNNNN' shorts.
+
+        Empty on any failure: this feeds a diagnostic, and a D-Bus
+        hiccup must not take down adapter initialisation.
+        """
+        try:
+            adapter = bus.get_object(BLUEZ_SERVICE_NAME, adapter_path)
+            props = Interface(adapter, DBUS_PROPERTIES_INTERFACE)
+            return [short
+                    for u in props.Get(BLUEZ_ADAPTER_INTERFACE, 'UUIDs')
+                    if (short := _uuid_to_short(u))]
+        except Exception as e:
+            _tlog(f'[adapter] could not read adapter UUIDs: '
+                  f'{type(e).__name__}: {e}')
+            return []
 
     @classmethod
     def _is_interesting_path(cls, path) -> bool:

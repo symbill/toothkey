@@ -301,6 +301,19 @@ In installed (systemd) mode, the worker's output is also captured in
     exits for any reason — the kernel drops a grab when the file
     descriptor closes, so a crash cannot leave your keyboard captured.
 
+- **The phone's call audio moved to the computer**
+  - Check for `[adapter] CALL-AUDIO RISK:` in `logs/toothkey.log`; it
+    names which of the two conditions is open.
+  - `./start.sh --reset-bluez` reasserts both fixes. Verify with
+    `bluetoothctl show`: no `Handsfree` or `Headset` UUIDs, and a
+    `Class` whose service bits are clear (`0x002540` is the goal).
+  - `journalctl -u bluetooth | grep -i hands-free` shows the attempts
+    if it is still happening.
+  - To get Bluetooth hands-free calling back on this machine, delete
+    `~/.config/wireplumber/wireplumber.conf.d/51-toothkey-no-headset-profiles.conf`
+    and restart `wireplumber` — but expect the phone to be able to
+    claim calls again while Tooth-key holds a bond.
+
 - **Tray says "waiting for the worker" / "reconnecting to the worker"**
   - That is the tray dialling the worker in the background; it retries
     forever, backing off to once every 5 s, and recovers on its own as
@@ -360,6 +373,36 @@ In installed (systemd) mode, the worker's output is also captured in
   usage IDs, which is exactly what a boot-protocol report carries, so
   there is no layout round-trip. See `keyboard_evdev.py` for the full
   rationale.
+- **Refuses to be the phone's audio device.** This is not optional
+  hygiene: with a bond in place, BlueZ's policy plugin connects the
+  services in its default `ReconnectUUIDs` — Headset AG, Handsfree AG
+  and both A2DP UUIDs, exactly what a phone advertises — every time a
+  link comes up. Since Tooth-key's whole job is to keep paging the
+  phone until the link *does* come up, that default turns every
+  reconnect into an invitation to move the phone's audio here. It has
+  happened: a live call went silent mid-sentence as this machine
+  attached to the phone as a Hands-Free unit, with nothing at the Linux
+  end indicating it. The keyboard carried on working perfectly
+  throughout, which is why "does HID still bind" is the wrong question
+  to judge the adapter by.
+
+  Two independent conditions allow it, and `./start.sh --reset-bluez`
+  closes both:
+
+  - `main.conf` gets `ReconnectUUIDs=` (empty), which disables BlueZ's
+    service-reconnect feature. Headphones that page *us* still connect;
+    only us chasing audio profiles on bonded devices stops.
+  - a WirePlumber drop-in (`conf/wireplumber-no-headset-profiles.conf`)
+    drops the HSP/HFP roles, so the Handsfree records leave the adapter
+    and a phone can no longer see this machine as a call route at all.
+    A2DP and LE Audio are kept, so Bluetooth headphones and streaming
+    music from the phone still work — only calls are given up.
+
+  The worker re-checks both at startup and logs `[adapter] CALL-AUDIO
+  RISK: ...` if either is undone, so this cannot quietly come back.
+  Fixing it also clears the Audio and Telephony bits from the Class of
+  Device, which is what the adapter wanted anyway.
+
 - **Ignores every peer that isn't a classic HID host.** A scanning
   adapter reports every LE advertiser in range; those use rotating
   random addresses and can't host a classic HID session, so they are
@@ -408,7 +451,7 @@ placement won't work.
 ## Tests
 
 ```bash
-python3 tests/run_all.py                # everything (127 tests)
+python3 tests/run_all.py                # everything (146 tests)
 ```
 
 | Suite                       | Covers |
@@ -420,6 +463,7 @@ python3 tests/run_all.py                # everything (127 tests)
 | `test_x11_hints.py`         | That the taskbar-hint helper refuses bad input and degrades quietly when python-xlib or the X server is missing, rather than breaking the toast path. |
 | `test_tray_link.py`         | That the worker keeps accepting trays — serving a second one after the first disconnects, never closing its listening socket, and pushing state to a reconnecting tray. |
 | `test_hid_reconnect.py`     | The peripheral-initiated HID retry: that a near-miss is retried, that the attempt cap and time budget hold, and that it stops when the ACL goes or a session is adopted. |
+| `test_call_audio_risk.py`   | The two conditions that let a phone route a call through this machine, that music and OBEX records are *not* flagged as that hazard, and that a working HID record is no evidence of safety. |
 
 None of them needs root, Bluetooth, or a display. The one thing they
 can't cover is `EVIOCGRAB` against real hardware — `tools/kbd_selftest.py`

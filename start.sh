@@ -72,6 +72,120 @@ function ensure_main_conf_class() {
     echo "  + wrote '$desired' into $conf"
 }
 
+function ensure_no_headset_profiles() {
+    # Stop this machine advertising itself as a call-audio device.
+    #
+    # The other half of the fix in ensure_main_conf_no_audio_reconnect:
+    # that one stops BlueZ connecting a bonded phone's audio by itself,
+    # this one removes the records that let a phone see us as somewhere
+    # to put a call at all. Either alone leaves a gap — without this,
+    # the phone could still pick us; without that, BlueZ still dials.
+    #
+    # WirePlumber registers the HSP/HFP roles over D-Bus, so
+    # bluetoothd's `-P` plugin blocklist cannot stop it. The drop-in
+    # turns off the headset roles only: A2DP and LE Audio stay, so
+    # Bluetooth headphones and speakers still work and the phone can
+    # still stream music here. Calls are the only thing given up.
+    #
+    # Installed per-user, because that is where WirePlumber runs. Never
+    # as root: this must not land in /root/.config, so the one caller
+    # is init_bluez, which runs as the invoking user.
+    if [ "$(id -u)" = "0" ]; then
+        echo "  ! skipping WirePlumber drop-in (running as root; it is a"
+        echo "    per-user config). Re-run ./start.sh as your own user."
+        return
+    fi
+    local src="$SCRIPT_DIR/conf/wireplumber-no-headset-profiles.conf"
+    local dir="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d"
+    local dst="$dir/51-toothkey-no-headset-profiles.conf"
+    if [ ! -f "$src" ]; then
+        echo "  ! $src missing; cannot disable headset profiles"
+        return
+    fi
+    mkdir -p "$dir"
+    if cmp -s "$src" "$dst"; then
+        echo "  = WirePlumber headset profiles already disabled"
+        return
+    fi
+    cp "$src" "$dst"
+    echo "  + installed $dst"
+    # WirePlumber reads its config once at startup.
+    if systemctl --user restart wireplumber 2>/dev/null; then
+        echo "  . restarted wireplumber"
+    else
+        echo "  ! could not restart wireplumber; log out and back in"
+    fi
+}
+
+function ensure_main_conf_no_audio_reconnect() {
+    # Stop BlueZ dragging a bonded phone's audio onto this machine.
+    #
+    # The policy plugin reconnects the services listed in ReconnectUUIDs
+    # whenever a bonded device's link comes back, and the built-in
+    # default is Headset AG, Handsfree AG and the two A2DP UUIDs —
+    # exactly what a phone advertises. toothkey keeps a bond with the
+    # phone and pages it until the link is up, so with that default
+    # every single reconnect is also an invitation to move the phone's
+    # audio here. Observed 2026-10-08: a live call went silent as this
+    # box attached to the phone as a Hands-Free unit.
+    #
+    # An empty list disables the reconnect feature, as main.conf's own
+    # comments document. It does NOT stop a headset that pages US from
+    # connecting, so Bluetooth headphones still work normally; it only
+    # stops us chasing audio profiles on devices we are bonded to.
+    local conf=/etc/bluetooth/main.conf
+    local desired='ReconnectUUIDs='
+    if [ ! -f "$conf" ]; then
+        echo "  ! $conf missing; skipping ReconnectUUIDs enforcement"
+        return
+    fi
+    # Already set and empty? Nothing to do. Matches an exactly-empty
+    # value only — a non-empty list is the thing we are removing.
+    if grep -qE '^[[:space:]]*ReconnectUUIDs[[:space:]]*=[[:space:]]*$' "$conf"; then
+        echo "  = $conf already has '$desired'"
+        return
+    fi
+    # The prose above the setting also says "ReconnectUUIDs", so match
+    # only a real assignment: the name has to be the first thing after
+    # an optional comment marker.
+    if grep -qE '^[[:space:]]*#?[[:space:]]*ReconnectUUIDs[[:space:]]*=' "$conf"; then
+        sudo sed -i.bak -E \
+            "s|^[[:space:]]*#?[[:space:]]*ReconnectUUIDs[[:space:]]*=.*|$desired|" "$conf"
+    elif grep -qE '^\[Policy\]' "$conf"; then
+        sudo sed -i.bak "/^\[Policy\]/a $desired" "$conf"
+    else
+        printf '\n[Policy]\n%s\n' "$desired" | sudo tee -a "$conf" >/dev/null
+    fi
+    echo "  + wrote '$desired' into $conf"
+}
+
+function ensure_main_conf_settings() {
+    # Every main.conf setting toothkey owns. Both are idempotent, and
+    # callers diff the file afterwards to decide whether bluetoothd
+    # needs restarting to re-read it.
+    ensure_main_conf_class
+    ensure_main_conf_no_audio_reconnect
+}
+
+function restart_bluetooth_if_main_conf_changed() {
+    # $1 = sha256 of main.conf taken before ensure_main_conf_settings.
+    # bluetoothd reads main.conf once at startup, so a change only takes
+    # effect after a restart. Restarting is disruptive (it drops the
+    # phone's link), hence only on an actual change.
+    local before="$1"
+    local after
+    after=$(sha256sum /etc/bluetooth/main.conf 2>/dev/null || echo "")
+    if [ "$before" = "$after" ]; then
+        return 1
+    fi
+    echo "main.conf changed; restarting bluetooth.service so bluez re-reads it"
+    sudo systemctl restart bluetooth
+    # Give bluetoothd time to come back up and re-expose the adapter
+    # before anything downstream tries to talk to it.
+    sleep 3
+    return 0
+}
+
 function write_toothkey_override() {
     # Any stray drop-in in /etc/systemd/system/bluetooth.service.d/ will
     # take precedence over our edits to the packaged unit file. Rather
@@ -214,7 +328,8 @@ print('; '.join(r))
 function init_bluez() {
     echo "Initializing BlueZ..."
     write_toothkey_override "${1:-}"
-    ensure_main_conf_class
+    ensure_main_conf_settings
+    ensure_no_headset_profiles
     quiet_obex_services
     echo "  . systemctl daemon-reload + restart bluetooth"
     sudo systemctl daemon-reload
@@ -311,7 +426,8 @@ usage: $0 [flag]
     --debug-off          disable bluetoothd debug and restart it; exit
     --install-launcher   install Tooth-key into the application menu; exit
     --uninstall-launcher remove the application-menu entry; exit
-    --quiet-obex         stop obexd (legacy; prefer --prepare-worker-bt); exit
+    --quiet-obex         stop obexd + assert main.conf settings; exit
+                         (run as root by the worker unit's ExecStartPre)
     --prepare-worker-bt  obex cleanup + bluetooth restart if adapter polluted; exit
     -h, --help           show this message and exit
 EOF
@@ -376,7 +492,19 @@ case "$1" in
         exit 0
         ;;
     --quiet-obex)
+        # The installed worker unit runs this as root before starting
+        # the worker, which makes it the one hook that reliably has the
+        # privileges to assert our BlueZ config. Keep the main.conf
+        # settings in here too, so a machine that only ever starts
+        # toothkey through systemd still gets them.
         quiet_obex_services
+        qo_before=$(sha256sum /etc/bluetooth/main.conf 2>/dev/null || echo "")
+        ensure_main_conf_settings
+        if restart_bluetooth_if_main_conf_changed "$qo_before"; then
+            # bluetoothd just restarted, which drops obexd's claim on
+            # the adapter and lets it re-register; clear it again.
+            quiet_obex_services
+        fi
         exit 0
         ;;
     --prepare-worker-bt)
@@ -477,15 +605,11 @@ if [ "${1:-}" != "--cli" ] \
     exit 0
 fi
 
-# Idempotent: make sure main.conf has the right Class every launch. If the
-# sed actually changes something, restart bluetooth so bluez re-reads it.
+# Idempotent: re-assert the main.conf settings toothkey owns on every
+# launch, and restart bluetooth only if that actually changed the file.
 before=$(sha256sum /etc/bluetooth/main.conf 2>/dev/null || echo "")
-ensure_main_conf_class
-after=$(sha256sum /etc/bluetooth/main.conf 2>/dev/null || echo "")
-if [ "$before" != "$after" ]; then
-    echo "main.conf changed; restarting bluetooth.service"
-    sudo systemctl restart bluetooth
-fi
+ensure_main_conf_settings
+restart_bluetooth_if_main_conf_changed "$before" || true
 
 # Grant root access to the user's X display. Keyboard capture doesn't
 # need it (the worker reads /dev/input directly), but the root worker
