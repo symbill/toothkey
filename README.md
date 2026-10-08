@@ -152,10 +152,15 @@ the same menu shortcut, manage it explicitly:
 1. **Launch**: just log in (installed mode) or run `./start.sh`. A
    tooth icon appears in the system tray with a red X overlay while
    disconnected.
-2. **Pair** (first time only): on your iPhone, go to
+2. **Pair** (first time only): the adapter is only findable while
+   **Pairing mode** is on, so pick that from the tray menu first —
+   unless nothing is paired yet, in which case Tooth-key opens the
+   window by itself at startup. Then on your iPhone go to
    Settings → Bluetooth → tap `Tooth-key (<hostname>)`. Confirm the
    numeric code on the phone. The Linux side auto-confirms. After the
-   first pair, the bond is remembered on both sides.
+   first pair, the bond is remembered on both sides and the window is
+   no longer needed — reconnecting uses the stored key, not
+   discoverability.
 3. **Reconnect** (subsequent runs): happens automatically, either from
    the iPhone or from Tooth-key paging the iPhone.
 4. **Type**: left-click the tray icon (or use the menu's Grab
@@ -174,6 +179,8 @@ the same menu shortcut, manage it explicitly:
 | Unpause _device-name_     | While paused       | Clears the pause flag and pages the saved peer immediately to bring the link back up. Hidden in every other state. |
 | Grab keyboard             | Connected + ungrabbed | Start forwarding key events to the Bluetooth peer. |
 | Ungrab keyboard           | Connected + grabbed   | Stop forwarding; keys reach local apps again. |
+| Pairing mode _(2 min)_    | Always, when closed | Makes the adapter discoverable **and** pairable for two minutes so a new phone can find it. Needed only to create a bond. |
+| Stop pairing mode         | While the window is open | Closes it immediately rather than waiting out the two minutes. |
 | Open log folder           | Always             | Opens `logs/` in your file manager. |
 | Restart                   | Always             | Clean stop + start. Uses `systemctl` in installed mode, re-execs `start.sh` otherwise. (Pause state does NOT survive a Restart — the new process starts un-paused and auto-reconnects.) |
 | Exit                      | Always             | Clean disconnect + quit. |
@@ -269,6 +276,16 @@ In installed (systemd) mode, the worker's output is also captured in
   - GNOME hides legacy tray icons. Install and enable the
     [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/);
     log out and back in.
+
+- **The iPhone can't see `Tooth-key` in its Bluetooth list**
+  - The adapter is deliberately not discoverable most of the time.
+    Pick **Pairing mode** from the tray menu and look again within two
+    minutes.
+  - `bluetoothctl show` should report `Discoverable: yes` and
+    `Pairable: yes` while the window is open, with a non-zero
+    `DiscoverableTimeout`.
+  - This only affects *new* pairings. An already-bonded phone
+    reconnects without either property.
 
 - **Red X stays on the icon forever**
   - The iPhone hasn't reconnected. Tap `Tooth-key (…)` in iOS
@@ -403,6 +420,20 @@ In installed (systemd) mode, the worker's output is also captured in
   Fixing it also clears the Audio and Telephony bits from the Class of
   Device, which is what the adapter wanted anyway.
 
+- **Not findable except when you ask.** Being discoverable and
+  pairable is only needed to acquire a bond; afterwards the phone
+  reconnects by address and Tooth-key pages it by address, so neither
+  property does anything useful. Leaving them on permanently does do
+  something useless and bad: it advertises the machine to everyone in
+  range, and because the pairing agent auto-confirms numeric
+  comparison, a stranger who tried could end up a bonded HID host —
+  receiving whatever is typed while grab is on. So the window is
+  closed by default, opens for two minutes from the tray menu, and
+  opens by itself at startup only when there is no bond yet (a fresh
+  install has to be findable or it could never be paired). BlueZ's own
+  `PairableTimeout` / `DiscoverableTimeout` enforce the two minutes, so
+  it closes even if the worker dies mid-window.
+
 - **Ignores every peer that isn't a classic HID host.** A scanning
   adapter reports every LE advertiser in range; those use rotating
   random addresses and can't host a classic HID session, so they are
@@ -451,7 +482,7 @@ placement won't work.
 ## Tests
 
 ```bash
-python3 tests/run_all.py                # everything (146 tests)
+python3 tests/run_all.py                # everything (164 tests)
 ```
 
 | Suite                       | Covers |
@@ -464,6 +495,7 @@ python3 tests/run_all.py                # everything (146 tests)
 | `test_tray_link.py`         | That the worker keeps accepting trays — serving a second one after the first disconnects, never closing its listening socket, and pushing state to a reconnecting tray. |
 | `test_hid_reconnect.py`     | The peripheral-initiated HID retry: that a near-miss is retried, that the attempt cap and time budget hold, and that it stops when the ACL goes or a session is adopted. |
 | `test_call_audio_risk.py`   | The two conditions that let a phone route a call through this machine, that music and OBEX records are *not* flagged as that hazard, and that a working HID record is no evidence of safety. |
+| `test_pairing_mode.py`      | That the pairing window sets both flags, hands BlueZ the timeout so it expires without us, closes itself, and defaults closed whenever a bond already exists. |
 
 None of them needs root, Bluetooth, or a display. The one thing they
 can't cover is `EVIOCGRAB` against real hardware — `tools/kbd_selftest.py`

@@ -186,6 +186,13 @@ ICON_SVG_PATH = os.path.join(HERE, 'toothkey.svg')
 # on hi-DPI displays and keeps the 16px variant sharp.
 ICON_SIZES = (16, 22, 24, 32, 48, 64, 128, 256)
 
+# Mirrors bluetooth_handler.PAIRING_WINDOW_S. Duplicated rather than
+# imported because the tray must not pull in the worker's BlueZ stack;
+# the worker's state broadcast is what actually ends the window, so a
+# drift here only affects the countdown shown in the tooltip.
+PAIRING_WINDOW_S = 120
+PAIRING_WINDOW_LABEL = '2 min'
+
 # Red X overlay geometry (in the SVG's 64x64 viewBox coordinates).
 X_STROKE_COLOR = QColor('#e23c3c')
 X_OUTLINE_COLOR = QColor('#5a0d0d')
@@ -1099,7 +1106,8 @@ class Tray(QObject):
 
         # Last-rendered state, used to skip redundant menu rebuilds.
         self._state = {'connected': False, 'name': None, 'mac': None,
-                       'grab': False, 'paused': False}
+                       'grab': False, 'paused': False,
+                       'pairing': False}
         self._shutting_down = False
         # True between "user clicked Grab" and "worker confirmed grab=True".
         # Drives the pulse animation on the floating indicator.
@@ -1122,6 +1130,13 @@ class Tray(QObject):
         self._relink_attempts = 0
         self._relink_delay_ms = self._RELINK_DELAY_MIN_MS
 
+        # Pairing-window countdown. Only drives the tooltip; the
+        # worker decides when the window actually ends.
+        self._pairing_started_at = None
+        self._pairing_timer = QTimer(self)
+        self._pairing_timer.setInterval(1000)
+        self._pairing_timer.timeout.connect(self._on_pairing_tick)
+
         self.link = WorkerLink(sock_path, self)
         self.link.state_changed.connect(self._on_state_changed)
         self.link.worker_gone.connect(self._on_worker_gone)
@@ -1138,7 +1153,8 @@ class Tray(QObject):
         self.menu.clear()
         s = getattr(self, '_state',
                     {'connected': False, 'name': None, 'mac': None,
-                     'grab': False, 'paused': False})
+                     'grab': False, 'paused': False,
+                     'pairing': False})
 
         label = s.get('name') or s.get('mac') or 'device'
 
@@ -1171,6 +1187,17 @@ class Tray(QObject):
                 grab = self.menu.addAction('Grab keyboard')
             grab.triggered.connect(self._on_toggle_grab)
             self.menu.addSeparator()
+
+        # Pairing mode. Always offered: it is the only way to get a
+        # NEW phone paired, and the adapter is deliberately neither
+        # discoverable nor pairable the rest of the time.
+        if s.get('pairing'):
+            pair_act = self.menu.addAction('Stop pairing mode')
+        else:
+            pair_act = self.menu.addAction(
+                f'Pairing mode ({PAIRING_WINDOW_LABEL})')
+        pair_act.triggered.connect(self._on_toggle_pairing)
+        self.menu.addSeparator()
 
         log_act = self.menu.addAction('Open log folder')
         log_act.triggered.connect(self._on_open_log_folder)
@@ -1236,6 +1263,12 @@ class Tray(QObject):
             self.tray.setIcon(self.icon_disconnected)
             suffix = ' (grab ON)' if grab else ''
             self.tray.setToolTip(f'Tooth-key: not connected{suffix}')
+
+        # While the pairing window is open its countdown owns the
+        # tooltip; the text set above would otherwise sit there stale
+        # until the next tick.
+        if self._pairing_started_at is not None:
+            self._on_pairing_tick()
 
         self._rebuild_menu()
 
@@ -1341,7 +1374,8 @@ class Tray(QObject):
         # _current_state() in worker.py produces.
         self._state = {
             k: msg.get(k)
-            for k in ('connected', 'name', 'mac', 'grab', 'paused')
+            for k in ('connected', 'name', 'mac', 'grab', 'paused',
+                      'pairing')
         }
 
         # Reconcile the floating indicator with the authoritative state
@@ -1355,6 +1389,8 @@ class Tray(QObject):
         #
         # Do this BEFORE _refresh_ui_from_state so the tray icon /
         # menu update and indicator update land on the same Qt tick.
+        self._on_pairing_changed(bool(self._state.get('pairing')))
+
         grab = bool(self._state.get('grab'))
         was_pending = self._grab_pending
         self._grab_pending = False
@@ -1389,7 +1425,8 @@ class Tray(QObject):
         # whole life, so a reconnect is the normal recovery and needs
         # no intervention.
         self._state = {'connected': False, 'name': None, 'mac': None,
-                       'grab': False, 'paused': False}
+                       'grab': False, 'paused': False,
+                       'pairing': False}
         self._grab_pending = False
         self.indicator.hide_indicator()
         self.tray.setIcon(self.icon_disconnected)
@@ -1489,6 +1526,56 @@ class Tray(QObject):
         self.link.send({'type': 'set_grab', 'on': False})
         self._state = dict(self._state, grab=False)
         self._refresh_ui_from_state()
+
+    def _on_toggle_pairing(self):
+        """Ask the worker to open or close the pairing window."""
+        new_state = not self._state.get('pairing', False)
+        print(f'[tray] pairing mode -> {new_state}')
+        self.link.send({'type': 'set_pairing', 'on': new_state})
+        # No optimistic flip here: unlike grab, there is nothing to
+        # show immediately and the worker answers within a poll. The
+        # state broadcast drives the menu, the toast and the countdown.
+
+    def _on_pairing_changed(self, pairing: bool):
+        """React to the worker's authoritative pairing state."""
+        if pairing and self._pairing_started_at is None:
+            self._pairing_started_at = time.monotonic()
+            self._pairing_timer.start()
+            self.toast.show_message(
+                f'Pairing mode on for {PAIRING_WINDOW_LABEL}. On the '
+                f'phone, pick <b>{self._advertised_name()}</b>.',
+                duration_ms=5000)
+        elif not pairing and self._pairing_started_at is not None:
+            self._pairing_started_at = None
+            self._pairing_timer.stop()
+            self.toast.show_message('Pairing mode off — no longer '
+                                    'discoverable.')
+
+    def _advertised_name(self) -> str:
+        """What the phone will show in its Bluetooth list."""
+        return f'Tooth-key ({socket.gethostname()})'
+
+    def _on_pairing_tick(self):
+        """Keep the remaining time in the tooltip, not the menu.
+
+        The menu is rebuilt from state, so putting a countdown in a
+        menu label would rebuild it every second; the tooltip is free
+        to change as often as we like.
+        """
+        if self._pairing_started_at is None:
+            self._pairing_timer.stop()
+            return
+        left = PAIRING_WINDOW_S - int(time.monotonic()
+                                      - self._pairing_started_at)
+        if left <= 0:
+            # The worker's state flip is authoritative; just stop
+            # counting and wait for it.
+            self._pairing_timer.stop()
+            return
+        self.tray.setToolTip(
+            f'Tooth-key\n'
+            f'Pairing mode: {left // 60}:{left % 60:02d} left\n'
+            f'Visible as {self._advertised_name()}')
 
     def _on_open_log_folder(self):
         _open_folder(LOG_DIR)

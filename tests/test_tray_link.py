@@ -184,6 +184,35 @@ class ServeTrayTests(unittest.TestCase):
         self.worker._serve_tray(conn)
         self.assertTrue(conn.closed)
 
+    def test_a_reset_is_not_treated_as_a_crash(self):
+        """A killed tray resets the socket; that is routine, not a fault.
+
+        It must not print a traceback, and the connection must still be
+        cleaned up so the next tray can be served.
+        """
+        class ResettingConn(FakeConn):
+            def makefile(self, mode, encoding=None):
+                outer = self
+
+                class FH:
+                    def __iter__(self_inner):
+                        raise ConnectionResetError(104, 'reset by peer')
+
+                    def write(self_inner, data):
+                        outer.written.append(data)
+
+                    def flush(self_inner):
+                        pass
+
+                    def close(self_inner):
+                        pass
+                return FH()
+
+        conn = ResettingConn()
+        self.worker._serve_tray(conn)   # must not raise
+        self.assertTrue(conn.closed)
+        self.assertIsNone(self.worker._out_fh)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

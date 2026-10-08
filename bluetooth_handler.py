@@ -77,6 +77,13 @@ def _tlog(msg: str) -> None:
     print(msg, flush=True)
 
 
+# How long the tray's "Pairing mode" leaves the adapter discoverable
+# and pairable. Long enough to walk to the phone, open Settings ->
+# Bluetooth and tap the entry; short enough that forgetting to close it
+# is not much of an exposure. BlueZ enforces it via PairableTimeout /
+# DiscoverableTimeout, so it holds even if this process dies.
+PAIRING_WINDOW_S = 120
+
 # Peripheral-initiated HID open (see _try_open_hid_outbound).
 #
 # The connect timeout is per channel. It used to be 10s, which is a long
@@ -717,6 +724,14 @@ class ToothkeyHandler:
     connected:bool = False
     _running:bool = False
 
+    # Pairing mode: the monotonic deadline until which the adapter is
+    # discoverable and pairable, or 0 when closed. Mirrors BlueZ's own
+    # PairableTimeout / DiscoverableTimeout, which are what actually
+    # expire it — this is for reporting state to the tray.
+    _pairing_until:float = 0.0
+    _pairing_thread:threading.Thread = None
+    _pairing_wake = threading.Event()
+
     # Cleared the first time btmgmt proves unusable (absent, or hanging
     # until its timeout). CoD gets reapplied several times during
     # startup, so retrying a binary that always times out costs seconds
@@ -879,6 +894,10 @@ class ToothkeyHandler:
                       'major/minor still read Peripheral/Keyboard, which '
                       'is what iOS matches on. `./start.sh --reset-bluez` '
                       'is the bigger hammer if pairing does start failing.')
+
+        # Now that the adapter is up and the HID profile is registered,
+        # settle whether we should be findable at all.
+        cls._apply_initial_pairing_mode()
 
         # Call-audio hijack check. Deliberately separate from the
         # pollution report: that one asks "will iOS still pair", this
@@ -2795,6 +2814,157 @@ class ToothkeyHandler:
               'then rerun ./start.sh.')
 
     @classmethod
+    def _bonded_peer_count(cls) -> int:
+        """How many bonded devices this adapter has.
+
+        Used to decide whether pairing mode should be open at startup:
+        with no bond there is nothing to reconnect to, so a fresh
+        install has to be findable or the user could never pair. Errs
+        toward 0 (open pairing) on failure, because a machine nobody
+        can pair with is a worse outcome than one that is briefly
+        visible.
+        """
+        bus = cls._bus
+        if bus is None:
+            return 0
+        try:
+            mgr = Interface(bus.get_object(BLUEZ_SERVICE_NAME, '/'),
+                            DBUS_OBJECT_MAPPER_INTERFACE)
+            count = 0
+            for _path, ifaces in mgr.GetManagedObjects().items():
+                dev = ifaces.get('org.bluez.Device1')
+                if dev and bool(dev.get('Bonded', dev.get('Paired'))):
+                    count += 1
+            return count
+        except Exception as e:
+            _tlog(f'[adapter] could not count bonded peers '
+                  f'({type(e).__name__}: {e}); assuming none')
+            return 0
+
+    @classmethod
+    def _apply_initial_pairing_mode(cls) -> None:
+        """Decide whether to be findable when the worker starts.
+
+        Being visible and pairable is only needed to acquire a bond.
+        Once there is one, the peer reconnects by address and we page it
+        by address, so staying discoverable only advertises this machine
+        to whoever is in range — and since our agent auto-confirms
+        numeric comparison, staying pairable means a stranger who tries
+        could end up a bonded HID host, receiving whatever is typed
+        while grab is on.
+
+        So: open the window only when there is no bond yet, because a
+        fresh install has to be findable or it could never be paired.
+        After that it is the tray menu's business.
+        """
+        if cls._bonded_peer_count() == 0:
+            print('[adapter] no bonded peer yet — opening pairing mode so '
+                  'a phone can find us')
+            cls.set_pairing_mode(True)
+        else:
+            cls.set_pairing_mode(False)
+
+    @classmethod
+    def set_pairing_mode(cls, on: bool, window_s: int = None) -> bool:
+        """Open or close the window in which a new peer can pair.
+
+        Sets Pairable and Discoverable together: both are only needed
+        to acquire a bond, and leaving either on permanently is what
+        exposes this machine. An existing bond is unaffected — a
+        reconnect uses the stored link key and neither property.
+
+        BlueZ's own PairableTimeout / DiscoverableTimeout do the
+        expiring, so the window closes even if this process dies
+        mid-way. `_pairing_until` mirrors it only so the tray can show
+        the state; `_pairing_expiry_thread` reconciles the two.
+
+        Returns the state actually reached.
+        """
+        window_s = PAIRING_WINDOW_S if window_s is None else int(window_s)
+        bus = cls._bus
+        if bus is None:
+            _tlog('[adapter] cannot change pairing mode: no D-Bus yet')
+            return False
+        adapter_path = cls._adapter_path
+        if not adapter_path:
+            _tlog('[adapter] cannot change pairing mode: no adapter')
+            return False
+
+        try:
+            adapter = bus.get_object(BLUEZ_SERVICE_NAME, adapter_path)
+            props = Interface(adapter, DBUS_PROPERTIES_INTERFACE)
+            timeout = dbus.UInt32(window_s if on else 0)
+            # Timeouts first: BlueZ applies the current timeout when
+            # the flag is switched on, so setting them afterwards would
+            # leave the window governed by the old value.
+            props.Set(BLUEZ_ADAPTER_INTERFACE, 'PairableTimeout', timeout)
+            props.Set(BLUEZ_ADAPTER_INTERFACE, 'DiscoverableTimeout', timeout)
+            props.Set(BLUEZ_ADAPTER_INTERFACE, 'Pairable',
+                      dbus.Boolean(bool(on)))
+            props.Set(BLUEZ_ADAPTER_INTERFACE, 'Discoverable',
+                      dbus.Boolean(bool(on)))
+        except Exception as e:
+            _tlog(f'[adapter] pairing mode -> {on} failed: '
+                  f'{type(e).__name__}: {e}')
+            return cls.is_pairing()
+
+        with cls._lock:
+            cls._pairing_until = (time.monotonic() + window_s) if on else 0.0
+        if on:
+            _tlog(f'[adapter] pairing mode OPEN for {window_s}s — '
+                  f'discoverable and pairable as "{build_device_name()}"')
+            cls._start_pairing_expiry()
+        else:
+            _tlog('[adapter] pairing mode closed — not discoverable, '
+                  'not pairable')
+            cls._pairing_wake.set()
+        return bool(on)
+
+    @classmethod
+    def is_pairing(cls) -> bool:
+        return cls.pairing_secs_left() > 0
+
+    @classmethod
+    def pairing_secs_left(cls) -> int:
+        until = cls._pairing_until
+        if not until:
+            return 0
+        return max(0, int(round(until - time.monotonic())))
+
+    @classmethod
+    def _start_pairing_expiry(cls) -> None:
+        """Close the window locally when it runs out.
+
+        BlueZ clears its own flags on timeout, but it does not tell us,
+        and the tray would otherwise keep offering "Stop pairing mode"
+        for a mode that already ended. This also re-asserts the off
+        state, so the two cannot disagree.
+        """
+        thread = cls._pairing_thread
+        if thread is not None and thread.is_alive():
+            cls._pairing_wake.set()      # restart the window
+            return
+
+        def run():
+            while cls._running:
+                cls._pairing_wake.clear()
+                remaining = cls.pairing_secs_left()
+                if remaining <= 0:
+                    break
+                # Wake early if the window is restarted or cancelled.
+                if cls._pairing_wake.wait(timeout=remaining + 0.5):
+                    if cls.pairing_secs_left() > 0:
+                        continue          # restarted; wait again
+                    return                # cancelled; already closed
+            if cls.pairing_secs_left() <= 0 and cls._running:
+                _tlog('[adapter] pairing window elapsed; closing')
+                cls.set_pairing_mode(False)
+
+        cls._pairing_thread = threading.Thread(
+            target=run, daemon=True, name='toothkey-pairing-window')
+        cls._pairing_thread.start()
+
+    @classmethod
     def prepare_adapter(cls):
         """Make sure the adapter is up and accepting new pairings without
         touching any existing bonds."""
@@ -2816,26 +2986,20 @@ class ToothkeyHandler:
         # bluetoothd over D-Bus and if that's wedged we'd hang forever
         # otherwise, blocking the worker before it can even emit a state
         # update. 15s is generous for a single bluetoothctl one-shot.
-        for args in (['power', 'on'], ['pairable', 'on'], ['discoverable', 'on']):
-            _bdiag(f'prepare_adapter: bluetoothctl {" ".join(args)}')
-            try:
-                subprocess.run(['bluetoothctl'] + args, timeout=15,
-                               capture_output=True, text=True)
-            except subprocess.TimeoutExpired:
-                _bdiag(f'prepare_adapter: bluetoothctl {" ".join(args)} TIMED OUT')
-                print(f'[adapter] bluetoothctl {" ".join(args)} TIMED OUT — continuing anyway')
-            _bdiag(f'prepare_adapter: bluetoothctl {" ".join(args)} returned')
-
-        # Bump discoverable-timeout to 0 so the adapter stays discoverable
-        # until we explicitly turn it off. Ignored silently on older bluez.
-        _bdiag('prepare_adapter: bluetoothctl discoverable-timeout 0')
+        _bdiag('prepare_adapter: bluetoothctl power on')
         try:
-            subprocess.run(['bluetoothctl', 'discoverable-timeout', '0'],
-                           timeout=15, capture_output=True, text=True)
+            subprocess.run(['bluetoothctl', 'power', 'on'], timeout=15,
+                           capture_output=True, text=True)
         except subprocess.TimeoutExpired:
-            _bdiag('prepare_adapter: bluetoothctl discoverable-timeout TIMED OUT')
-            print('[adapter] bluetoothctl discoverable-timeout TIMED OUT')
-        _bdiag('prepare_adapter: bluetoothctl discoverable-timeout returned')
+            _bdiag('prepare_adapter: bluetoothctl power on TIMED OUT')
+            print('[adapter] bluetoothctl power on TIMED OUT — continuing anyway')
+
+        # Pairable / Discoverable are deliberately NOT touched here:
+        # this runs before the D-Bus connection exists (hence the
+        # bluetoothctl calls above), and the decision needs to know how
+        # many bonded peers there are. initialize() settles it once the
+        # adapter and HID profile are actually ready — see
+        # _apply_initial_pairing_mode.
 
         _bdiag('prepare_adapter: set_class_of_device')
         cls.set_class_of_device(CLASS_OF_DEVICE_PERIPHERAL_KEYBOARD)

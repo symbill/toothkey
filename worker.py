@@ -181,6 +181,12 @@ def _current_state() -> dict:
         'mac': ToothkeyHandler.client_mac_address,
         'grab': bool(GlobalContext.grab_mode),
         'paused': paused,
+        # Only the boolean, not the seconds remaining: the poller emits
+        # on any change, and a ticking countdown here would rebuild the
+        # tray menu several times a second. The tray runs its own clock
+        # for the tooltip and treats this flipping to False as the
+        # authoritative end of the window.
+        'pairing': bool(ToothkeyHandler.is_pairing()),
     }
 
 
@@ -254,6 +260,16 @@ def _command_reader(rfh):
             elif t == 'unpause':
                 print('[worker] command: unpause')
                 ToothkeyHandler.unpause_client()
+            elif t == 'set_pairing':
+                on = bool(msg.get('on'))
+                print(f'[worker] command: set_pairing({on})')
+                reached = ToothkeyHandler.set_pairing_mode(on)
+                if reached != on:
+                    print(f'[worker] set_pairing({on}) could not be '
+                          f'honoured; pairing mode is {reached}')
+                # Report immediately rather than waiting for the next
+                # poll, so a refused request flips the menu back.
+                _send({'type': 'state', **_current_state()})
             elif t == 'set_grab':
                 on = bool(msg.get('on'))
                 print(f'[worker] command: set_grab({on})')
@@ -306,6 +322,13 @@ def _command_reader(rfh):
                 return
             else:
                 print(f'[worker] unknown command: {msg}')
+    except (ConnectionResetError, BrokenPipeError) as e:
+        # The tray went away without closing cleanly: killed, crashed,
+        # or its session ended. That is an ordinary way for a tray to
+        # disappear, not a fault, and the recovery is identical to EOF —
+        # release the grab below and go back to accepting trays. A
+        # traceback here would make a routine event look like a bug.
+        print(f'[worker] tray connection reset: {type(e).__name__}: {e}')
     except Exception as e:
         print(f'[worker] command reader crashed: {type(e).__name__}: {e}')
         traceback.print_exc()
