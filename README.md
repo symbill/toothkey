@@ -58,9 +58,12 @@ Now keyboard-only, more reliable persisted pairing, and a proper tray UI.
   Kubuntu/KDE)
 - `python3-xlib`, for the one window-manager hint Qt can't set (keeping
   the floating tooth and the toast out of the taskbar)
-- `xclip` and/or `wl-clipboard` on the user's `$PATH` (auto-installed;
-  required for the Ctrl+V "paste desktop clipboard into iPhone"
-  feature — without them Ctrl+V silently does nothing)
+- `wl-clipboard` in a Wayland session, `xclip` in an X11 one
+  (auto-installed; required for the Ctrl+V "paste desktop clipboard
+  into iPhone" feature — without it Ctrl+V silently does nothing).
+  Under Wayland `xclip` is not a substitute: it reaches a copy made
+  in a native Wayland app only through XWayland, which KWin shares
+  the clipboard with only while an X11 window has focus.
 
 All Python / apt dependencies are installed automatically the first
 time you run either `./install.sh` or `./start.sh`. Both delegate to
@@ -346,11 +349,17 @@ In installed (systemd) mode, the worker's output is also captured in
 
 - **Ctrl+V doesn't paste anything into the iPhone**
   - Check `logs/toothkey.log` for a `[kbd] clipboard read failed: …`
-    line. The most common cause is `xclip` / `wl-paste` not being on
-    `$PATH`; install with `sudo apt install xclip wl-clipboard` and
-    grab again. Tooth-key tries `wl-paste` first when
-    `WAYLAND_DISPLAY` is set, then `xclip`, so installing both is the
-    safest option for mixed X11/Wayland setups.
+    line; it lists each helper tried and why it failed. The most
+    common cause is `xclip` / `wl-paste` not being on `$PATH`; install
+    with `sudo apt install xclip wl-clipboard` and grab again.
+    Tooth-key tries `wl-paste` first when `WAYLAND_DISPLAY` is set,
+    then `xclip`, so installing both is the safest option for mixed
+    X11/Wayland setups.
+  - In a Wayland session, `xclip rc=1: Error: target STRING not
+    available` usually means XWayland isn't being shown the clipboard
+    (KWin shares a native Wayland app's copy with it only while an X11
+    window has focus), not that the clipboard is empty. `wl-paste` is
+    the helper that has to work there.
   - The clipboard read happens inside the (root) worker process,
     using the `DISPLAY` / `WAYLAND_DISPLAY` / `XAUTHORITY` env vars
     the tray forwarded over the IPC handshake. If the tray hasn't

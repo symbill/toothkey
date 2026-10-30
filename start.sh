@@ -632,14 +632,18 @@ function ensure_python_deps() {
         fi
     done
 
-    # Clipboard helpers used by the Ctrl+V "paste desktop clipboard
-    # into iPhone" feature in keyboard_handler.py. Treat them like a
-    # Python dep — if BOTH are missing, fall back to a full
-    # install_dependencies pass so this branch is reachable on
-    # already-`.initiated` machines after a code update.
-    if ! command -v xclip >/dev/null 2>&1 \
-       && ! command -v wl-paste >/dev/null 2>&1; then
-        missing+=("xclip|wl-clipboard")
+    # Clipboard helper used by the Ctrl+V "paste desktop clipboard
+    # into iPhone" feature in keyboard_handler.py. Each session type
+    # needs its own: under Wayland, xclip reaches a copy made in a
+    # native Wayland app only through XWayland, which KWin shares the
+    # clipboard with only while an X11 window has focus, so xclip
+    # cannot stand in for wl-paste. Treat the missing one like a
+    # Python dep, so an already-`.initiated` machine catches up after
+    # a code update.
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        command -v wl-paste >/dev/null 2>&1 || missing+=("wl-clipboard")
+    elif ! command -v xclip >/dev/null 2>&1; then
+        missing+=("xclip")
     fi
 
     if [ "${#missing[@]}" -gt 0 ]; then

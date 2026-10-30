@@ -86,43 +86,54 @@ def _read_desktop_clipboard():
     still do. Returns the decoded clipboard text, or None if both
     helpers are unavailable / errored / empty.
     """
-    # Wayland sessions keep the Wayland clipboard separate from the
-    # XWayland (X11) clipboard, and the user's "real" copy lives in
-    # the Wayland one — so try wl-paste first when WAYLAND_DISPLAY
-    # is set, falling back to xclip if it's missing or returns empty.
+    # In a Wayland session wl-paste is the helper that works. xclip
+    # reaches a copy made in a native Wayland app only through
+    # XWayland, and KWin shares the Wayland clipboard with XWayland
+    # only while an X11 window has focus; with a native Wayland window
+    # focused, xclip finds no owner at all. `--type text` makes
+    # wl-paste refuse a clipboard that offers no text rather than hand
+    # back image bytes to be typed out, matching xclip, which only
+    # asks for text.
     candidates = []
     if os.environ.get('WAYLAND_DISPLAY'):
-        candidates.append(['wl-paste', '--no-newline'])
+        candidates.append(
+            ('wl-clipboard', ['wl-paste', '--no-newline', '--type', 'text']))
     if os.environ.get('DISPLAY'):
-        candidates.append(['xclip', '-selection', 'clipboard', '-out'])
+        candidates.append(
+            ('xclip', ['xclip', '-selection', 'clipboard', '-out']))
 
     if not candidates:
         print('[kbd] clipboard read: no DISPLAY or WAYLAND_DISPLAY set; '
               'tray handshake may not have happened yet')
         return None
 
-    last_err = None
-    for cmd in candidates:
+    # Every helper's failure is reported, not just the last one's: xclip
+    # is tried last, and its complaint on its own hides why wl-paste —
+    # the helper that matters under Wayland — didn't answer.
+    errors = []
+    for package, cmd in candidates:
         try:
             r = subprocess.run(
                 cmd, capture_output=True, timeout=2.0)
         except FileNotFoundError:
-            last_err = (f'{cmd[0]} not installed; '
-                        'apt install xclip wl-clipboard')
+            errors.append(f'{cmd[0]} not installed '
+                          f'(sudo apt install {package})')
             continue
         except subprocess.TimeoutExpired:
-            last_err = f'{cmd[0]} timed out after 2s'
+            errors.append(f'{cmd[0]} timed out after 2s')
             continue
         except Exception as e:
-            last_err = f'{cmd[0]}: {type(e).__name__}: {e}'
+            errors.append(f'{cmd[0]}: {type(e).__name__}: {e}')
             continue
 
         if r.returncode != 0:
             # xclip prints "Error: target STRING not available" to
-            # stderr when the clipboard is empty or holds non-text;
-            # surface it but keep trying further candidates.
+            # stderr when the clipboard is empty, holds non-text, or
+            # is not being shared with XWayland; surface it but keep
+            # trying further candidates.
             err = r.stderr.decode('utf-8', errors='replace').strip()
-            last_err = f'{cmd[0]} rc={r.returncode}: {err or "(no stderr)"}'
+            errors.append(f'{cmd[0]} rc={r.returncode}: '
+                          f'{err or "(no stderr)"}')
             continue
 
         try:
@@ -131,10 +142,9 @@ def _read_desktop_clipboard():
             text = r.stdout.decode('latin-1', errors='replace')
         if text:
             return text
-        last_err = f'{cmd[0]}: clipboard empty'
+        errors.append(f'{cmd[0]}: clipboard empty')
 
-    if last_err:
-        print(f'[kbd] clipboard read failed: {last_err}')
+    print(f'[kbd] clipboard read failed: {"; ".join(errors)}')
     return None
 
 
